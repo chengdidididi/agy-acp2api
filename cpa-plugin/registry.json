@@ -27,35 +27,35 @@
             "goos": "darwin",
             "goarch": "amd64",
             "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.0_darwin_amd64.zip",
-            "sha256": "e61a4840d48f66906f522017d3eef9cf38aa08f9cd1b586a13c60127094c426b",
+            "sha256": "647313c488e14596ca072e3e8498ae26d212082068c44c0c932dbb591a231994",
             "size": 2657836
           },
           {
             "goos": "darwin",
             "goarch": "arm64",
             "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.0_darwin_arm64.zip",
-            "sha256": "0accc166ee6b9382602016727c18be32c6c355a05a0ea1bc95a43cb2175f332c",
-            "size": 2494503
+            "sha256": "27e0988cb8de9e50689bec9b3e4f3cea35bb42ff2c6985ec4c2f16ef911f37bd",
+            "size": 2494501
           },
           {
             "goos": "linux",
             "goarch": "amd64",
             "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.0_linux_amd64.zip",
-            "sha256": "ea13d5f5e19d83deaccfb2da9f03b4ff495413d95adfaaddcac4a34b10aa7562",
-            "size": 2790392
+            "sha256": "b5f7ae710d3da02bc83e221b022ff9c660e985d323217b06525ba62f35ec2722",
+            "size": 2790393
           },
           {
             "goos": "linux",
             "goarch": "arm64",
             "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.0_linux_arm64.zip",
-            "sha256": "544a58083f60056efc86eafe178864f8341cef2d8035ccc506d96cbb0c98898a",
+            "sha256": "e29216a98a3bbca28f0c17ed1f3d077f7d2662c88149cadccea4c7eac95b3e28",
             "size": 2577270
           },
           {
             "goos": "windows",
             "goarch": "amd64",
             "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.0_windows_amd64.zip",
-            "sha256": "9bc585b2255bc2105c8fbe66f4f78fd3b6447e2eeb448b1400a0bdb8b0a41e09",
+            "sha256": "36670a4f9f7069a66d8a141d08f1210074b1e6968de8e618047d9cc5188c6109",
             "size": 2719212
           }
         ]
