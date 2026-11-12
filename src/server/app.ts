@@ -259,7 +259,10 @@ export function createGatewayApp(pool: WorkerPool): Hono {
 
     try {
       if (lease.isReusedSession && sessionId) {
-        promptText = compileDeltaPrompt(lease.deltaMessages);
+        promptText = compileDeltaPrompt(
+          lease.deltaMessages,
+          lease.isRetryAfterInterrupt
+        );
       } else {
         const compiled = compileFullPrompt(
           body.messages,
@@ -358,9 +361,19 @@ export function createGatewayApp(pool: WorkerPool): Hono {
     if (isStream) {
       return streamSSE(c, async (stream) => {
         const abortController = new AbortController();
-        stream.onAbort(() => {
-          abortController.abort();
-        });
+        const triggerAbort = () => {
+          if (!abortController.signal.aborted) {
+            abortController.abort();
+          }
+        };
+        stream.onAbort(triggerAbort);
+        if (c.req.raw.signal.aborted) {
+          triggerAbort();
+        } else {
+          c.req.raw.signal.addEventListener("abort", triggerAbort, {
+            once: true,
+          });
+        }
 
         let currentRespondingModel = baseModelId;
 
@@ -384,7 +397,8 @@ export function createGatewayApp(pool: WorkerPool): Hono {
         });
 
         const sendChunk = (chunk: OpenAIChatCompletionChunk) => {
-          stream.writeSSE({ data: JSON.stringify(chunk) });
+          if (abortController.signal.aborted) return;
+          stream.writeSSE({ data: JSON.stringify(chunk) }).catch(() => {});
         };
 
         sendChunk(makeChunk({ role: "assistant" }));
@@ -448,7 +462,8 @@ export function createGatewayApp(pool: WorkerPool): Hono {
             body.tools,
             [...body.messages, assistantMsg],
             lease.worker.id,
-            sessionId!
+            sessionId!,
+            promptRes.usage?.totalTokens ?? 0
           );
 
           telemetryStore.recordCompletedRequest({
@@ -476,6 +491,19 @@ export function createGatewayApp(pool: WorkerPool): Hono {
             status: "success",
           });
         } catch (err: any) {
+          parser.flush(
+            () => {},
+            () => {}
+          );
+          const partialMsg = parser.toAssistantMessage();
+          await pool.handleFailedTurnSession(
+            lease.worker,
+            sessionId,
+            lease.isReusedSession,
+            err,
+            partialMsg
+          );
+
           telemetryStore.recordCompletedRequest({
             requestId: completionId,
             timestamp: Date.now(),
@@ -501,14 +529,22 @@ export function createGatewayApp(pool: WorkerPool): Hono {
             status: "error",
             errorMessage: err?.message || String(err),
           });
-          sendChunk(
-            makeChunk(
-              { content: `\n[Gateway Error: ${err?.message || String(err)}]` },
-              "stop"
-            )
-          );
-          await stream.writeSSE({ data: "[DONE]" });
+
+          if (!abortController.signal.aborted) {
+            try {
+              sendChunk(
+                makeChunk(
+                  {
+                    content: `\n[Gateway Error: ${err?.message || String(err)}]`,
+                  },
+                  "stop"
+                )
+              );
+              await stream.writeSSE({ data: "[DONE]" });
+            } catch {}
+          }
         } finally {
+          c.req.raw.signal.removeEventListener("abort", triggerAbort);
           pool.releaseWorker(lease.worker);
         }
       });
@@ -555,7 +591,8 @@ export function createGatewayApp(pool: WorkerPool): Hono {
         body.tools,
         [...body.messages, assistantMsg],
         lease.worker.id,
-        sessionId
+        sessionId,
+        promptRes.usage?.totalTokens ?? 0
       );
 
       telemetryStore.recordCompletedRequest({
@@ -607,6 +644,19 @@ export function createGatewayApp(pool: WorkerPool): Hono {
         usage: usageDetails,
       });
     } catch (err: any) {
+      parser.flush(
+        () => {},
+        () => {}
+      );
+      const partialMsg = parser.toAssistantMessage();
+      await pool.handleFailedTurnSession(
+        lease.worker,
+        sessionId,
+        lease.isReusedSession,
+        err,
+        partialMsg
+      );
+
       telemetryStore.recordCompletedRequest({
         requestId: completionId,
         timestamp: Date.now(),

@@ -282,6 +282,11 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   input[type=number] { -moz-appearance:textfield; }
   .row2 { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:16px; }
   .row2 .field + .field { margin-top:6px; }
+  .ttl-hint { display:flex; align-items:flex-start; gap:8px; margin-top:10px; padding:8px 12px; border-radius:12px; font-size:12px; line-height:1.5;
+              background:var(--sc-high); color:var(--on-surface-variant); transition:background .2s var(--ease), color .2s var(--ease); }
+  .ttl-hint .ms { font-size:16px; margin-top:1px; flex:none; }
+  .ttl-hint.warn { background:var(--warning-container); color:var(--on-warning-container); }
+  .ttl-hint + .row2 { margin-top:20px; }
 
   .savebar { position:fixed; right:28px; bottom:28px; display:flex; gap:8px; padding:8px; border-radius:28px; background:var(--sc-high);
              box-shadow:0 4px 8px 3px rgba(0,0,0,.15), 0 1px 3px rgba(0,0,0,.3); transform:translateY(140%); opacity:0; transition:all .25s var(--ease); z-index:15; }
@@ -452,7 +457,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     <section class="page" id="page-runtime">
       <div class="card" id="rt-pool"></div>
       <div class="section-h"><span>进程</span><span class="grow"></span>
-        <button class="btn outlined" data-act="clear"><span class="ms">cleaning_services</span>清空哈希</button>
+        <button class="btn outlined" data-act="clear"><span class="ms">cleaning_services</span>清空映射</button>
         <button class="btn tonal" data-act="spawn"><span class="ms">add</span>扩容</button>
       </div>
       <div class="grid workers" id="rt-workers"></div>
@@ -511,9 +516,13 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
             <div class="field"><label>空闲回收</label>
               <div class="field-box"><input id="f-idle" type="number" min="5" step="5" /><span class="suffix">秒</span></div>
             </div>
-            <div class="field"><label>会话哈希有效期</label>
+            <div class="field"><label>会话有效期</label>
               <div class="field-box"><input id="f-sess" type="number" min="1" step="1" /><span class="suffix">分钟</span></div>
             </div>
+          </div>
+          <div class="ttl-hint" id="ttl-hint">
+            <span class="ms" id="ttl-hint-ic">info</span>
+            <span id="ttl-hint-txt">每次请求自动续期；上游 KV 缓存约 5 分钟，建议均不低于 5 分钟（300 秒），请勿改得过小。</span>
           </div>
           <div class="row2">
             <div class="field"><label>请求超时</label>
@@ -966,7 +975,27 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     $("f-idle").value = Math.round(c.workerIdleTtlMs / 1000);
     $("f-sess").value = trimZ((c.sessionTtlMs / 60000).toFixed(1));
     $("f-timeout").value = Math.round((c.requestTimeoutMs || 300000) / 1000);
+    updateTtlHint();
     S.cfgReady = true;
+  }
+  function updateTtlHint() {
+    var box = $("ttl-hint"), ic = $("ttl-hint-ic"), txt = $("ttl-hint-txt");
+    if (!box || !ic || !txt) return;
+    var idleSec = Number($("f-idle").value) || 0;
+    var sessMin = Number($("f-sess").value) || 0;
+    if (sessMin < 5 || idleSec < 300) {
+      box.className = "ttl-hint warn";
+      ic.textContent = "warning";
+      txt.textContent = "当前值低于上游 5 分钟 KV 缓存窗口，阅读或思考间隙易导致会话与缓存过早失效，建议不低于 300 秒 / 5 分钟。";
+    } else if (idleSec < sessMin * 60) {
+      box.className = "ttl-hint warn";
+      ic.textContent = "warning";
+      txt.textContent = "「空闲回收」短于「会话有效期」（约 " + Math.round(sessMin * 60) + " 秒），建议保持空闲回收 ≥ 会话有效期以稳定复用缓存。";
+    } else {
+      box.className = "ttl-hint";
+      ic.textContent = "info";
+      txt.textContent = "每次请求自动续期；上游 KV 缓存约 5 分钟，建议均不低于 5 分钟（300 秒），请勿改得过小。";
+    }
   }
   function setDirty(v) { S.dirty = v; $("savebar").classList.toggle("on", v); }
   async function saveCfg() {
@@ -1217,7 +1246,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       }
       else if (a === "spawn") { var j = await api("POST", "./api/admin/workers/spawn"); snack("已启动 " + j.workerId); poll(); }
       else if (a === "clear") {
-        if (await confirmDlg("cleaning_services", "清空会话哈希", "后续请求将新建会话，无法复用已有上下文", "清空")) {
+        if (await confirmDlg("cleaning_services", "清空会话映射", "后续请求将新建会话，无法复用已有上下文", "清空")) {
           await api("POST", "./api/admin/sessions/clear-cache"); snack("已清空"); poll();
         }
       }
@@ -1249,7 +1278,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     } catch (err) { snack(err && err.message ? err.message : String(err), true); }
   });
 
-  $("settings-form").addEventListener("input", function () { if (!S.cfgReady) return; setDirty(true); });
+  $("settings-form").addEventListener("input", function () { updateTtlHint(); if (!S.cfgReady) return; setDirty(true); });
   $("q").addEventListener("input", function (e) { S.q = e.target.value; if (S.d) renderTraffic(S.d); });
   document.addEventListener("keydown", function (e) { if (e.key === "Escape" && S.sheet) closeSheet(); });
 

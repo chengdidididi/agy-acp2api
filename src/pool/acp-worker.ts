@@ -32,6 +32,32 @@ export interface ExtendedPromptExecutionResult extends AcpPromptResult {
   actualModelVersion: string;
 }
 
+export class PromptInterruptedError extends Error {
+  public readonly isTimeout: boolean;
+  public readonly isClientAbort: boolean;
+  public readonly cancelSettled: boolean;
+  public readonly promptSent: boolean;
+
+  constructor(
+    message: string,
+    opts: {
+      isTimeout: boolean;
+      isClientAbort: boolean;
+      cancelSettled: boolean;
+      promptSent: boolean;
+    }
+  ) {
+    super(message);
+    this.name = "PromptInterruptedError";
+    this.isTimeout = opts.isTimeout;
+    this.isClientAbort = opts.isClientAbort;
+    this.cancelSettled = opts.cancelSettled;
+    this.promptSent = opts.promptSent;
+  }
+}
+
+const CANCEL_SETTLE_TIMEOUT_MS = 3000;
+
 interface PendingRpc {
   resolve: (val: any) => void;
   reject: (err: Error) => void;
@@ -55,6 +81,9 @@ export class AcpWorker {
   private pendingRpcs = new Map<number | string, PendingRpc>();
   private activeStreamListeners = new Map<string, PromptStreamCallbacks>();
   private activeSessions = new Set<string>();
+  private cancellingSessions = new Set<string>();
+  private idleWaiters: Array<() => void> = [];
+  private cancelListeners = new Map<string, Array<() => void>>();
   private sessionAssignedModel = new Map<string, string>();
   private sessionConfirmedConfig = new Map<
     string,
@@ -147,6 +176,97 @@ export class AcpWorker {
     return this.activeSessions.has(sessionId);
   }
 
+  public isCancellingSession(sessionId: string): boolean {
+    return this.cancellingSessions.has(sessionId);
+  }
+
+  public hasIdleWaiters(): boolean {
+    return this.idleWaiters.length > 0;
+  }
+
+  public notifyIdle(): void {
+    const waiters = this.idleWaiters.splice(0, this.idleWaiters.length);
+    for (const fn of waiters) {
+      fn();
+    }
+  }
+
+  private notifySessionCancelling(sessionId: string): void {
+    const list = this.cancelListeners.get(sessionId);
+    if (!list) return;
+    this.cancelListeners.delete(sessionId);
+    for (const fn of list) {
+      fn();
+    }
+  }
+
+  /**
+   * Waits for this worker to return to `IDLE` when an incoming retry request matches
+   * a session on this worker that is currently settling `session/cancel` (or about to
+   * receive the client's TCP abort within `raceGraceMs`).
+   */
+  public waitForSessionSettle(
+    sessionId: string,
+    cancelSettleMs: number = 3500,
+    raceGraceMs: number = 1000
+  ): Promise<boolean> {
+    if (this.state === "IDLE") {
+      return Promise.resolve(this.hasSession(sessionId));
+    }
+    if (this.state === "DEAD" || !this.hasSession(sessionId)) {
+      return Promise.resolve(false);
+    }
+
+    return new Promise<boolean>((resolve) => {
+      let done = false;
+      let timer: NodeJS.Timeout | null = null;
+
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        const idleIdx = this.idleWaiters.indexOf(onIdle);
+        if (idleIdx !== -1) {
+          this.idleWaiters.splice(idleIdx, 1);
+        }
+        const cList = this.cancelListeners.get(sessionId);
+        if (cList) {
+          const cIdx = cList.indexOf(onCancelStart);
+          if (cIdx !== -1) cList.splice(cIdx, 1);
+          if (cList.length === 0) this.cancelListeners.delete(sessionId);
+        }
+        resolve(this.state === "IDLE" && this.hasSession(sessionId));
+      };
+
+      const onIdle = () => {
+        finish();
+      };
+
+      const onCancelStart = () => {
+        if (done) return;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(finish, cancelSettleMs);
+        timer.unref?.();
+      };
+
+      this.idleWaiters.push(onIdle);
+
+      if (this.cancellingSessions.has(sessionId)) {
+        timer = setTimeout(finish, cancelSettleMs);
+        timer.unref?.();
+      } else {
+        const list = this.cancelListeners.get(sessionId) || [];
+        list.push(onCancelStart);
+        this.cancelListeners.set(sessionId, list);
+        timer = setTimeout(finish, raceGraceMs);
+        timer.unref?.();
+      }
+    });
+  }
+
   /**
    * Creates a new ACP session on this worker in native `default` mode (no plan/build switching),
    * sets the target `acpModelId`, and injects `<system_override>` + external tool schemas.
@@ -212,7 +332,7 @@ export class AcpWorker {
   /**
    * Executes a `session/prompt` turn on an existing `sessionId`, measuring TTFT,
    * capturing actual responding modelVersion via the local CCPA sniffer + ACP config updates,
-   * and returning token + cache usage.
+   * and cleanly settling `session/cancel` on both client aborts and gateway timeouts.
    */
   public async runPrompt(
     sessionId: string,
@@ -221,7 +341,48 @@ export class AcpWorker {
     callbacks: PromptStreamCallbacks,
     abortSignal?: AbortSignal
   ): Promise<ExtendedPromptExecutionResult> {
-    await this.ensureSessionModel(sessionId, acpModelId);
+    if (abortSignal?.aborted) {
+      throw new PromptInterruptedError("Request aborted before prompt started", {
+        isTimeout: false,
+        isClientAbort: true,
+        cancelSettled: true,
+        promptSent: false,
+      });
+    }
+
+    const onPrePromptAbort = () => {
+      this.cancellingSessions.add(sessionId);
+      this.notifySessionCancelling(sessionId);
+    };
+    if (abortSignal) {
+      abortSignal.addEventListener("abort", onPrePromptAbort, { once: true });
+    }
+    try {
+      await this.ensureSessionModel(sessionId, acpModelId);
+    } finally {
+      if (abortSignal) {
+        abortSignal.removeEventListener("abort", onPrePromptAbort);
+      }
+    }
+
+    if (abortSignal?.aborted) {
+      this.cancellingSessions.delete(sessionId);
+      throw new PromptInterruptedError("Request aborted before prompt started", {
+        isTimeout: false,
+        isClientAbort: true,
+        cancelSettled: true,
+        promptSent: false,
+      });
+    }
+
+    if (this.state === "DEAD" || !this.proc?.stdin.writable) {
+      throw new PromptInterruptedError(`Worker ${this.id} is not writable`, {
+        isTimeout: false,
+        isClientAbort: false,
+        cancelSettled: false,
+        promptSent: false,
+      });
+    }
 
     this.sniffer.resetTurnModel();
     const startTime = Date.now();
@@ -246,27 +407,140 @@ export class AcpWorker {
 
     this.activeStreamListeners.set(sessionId, wrappedCallbacks);
 
-    const onAbort = () => {
-      this.sendNotification("session/cancel", { sessionId });
-    };
-
-    if (abortSignal) {
-      if (abortSignal.aborted) {
-        onAbort();
-      } else {
-        abortSignal.addEventListener("abort", onAbort, { once: true });
-      }
-    }
+    const rpcId = this.rpcIdCounter++;
+    const timeoutMs = config.requestTimeoutMs;
 
     try {
-      const result = await this.sendRpc<AcpPromptResult>(
-        "session/prompt",
-        {
-          sessionId,
-          prompt: [{ type: "text", text: promptText }],
-        },
-        config.requestTimeoutMs
-      );
+      const result = await new Promise<AcpPromptResult>((resolve, reject) => {
+        let settled = false;
+        let interruptReason: "abort" | "timeout" | null = null;
+        let cancelSettleTimer: NodeJS.Timeout | null = null;
+
+        const cleanup = () => {
+          clearTimeout(requestTimer);
+          if (cancelSettleTimer) {
+            clearTimeout(cancelSettleTimer);
+            cancelSettleTimer = null;
+          }
+          if (abortSignal) {
+            abortSignal.removeEventListener("abort", onAbort);
+          }
+        };
+
+        const markCancelStart = (reason: "abort" | "timeout") => {
+          if (settled || interruptReason !== null) return;
+          interruptReason = reason;
+          clearTimeout(requestTimer);
+
+          // Detach stream callbacks immediately so post-cancel chunks do not leak
+          this.activeStreamListeners.delete(sessionId);
+
+          this.cancellingSessions.add(sessionId);
+          this.notifySessionCancelling(sessionId);
+          this.sendNotification("session/cancel", { sessionId });
+
+          cancelSettleTimer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            this.pendingRpcs.delete(rpcId);
+            this.cancellingSessions.delete(sessionId);
+
+            const msg =
+              reason === "timeout"
+                ? `ACP RPC 'session/prompt' timed out after ${timeoutMs}ms and session/cancel did not settle within ${CANCEL_SETTLE_TIMEOUT_MS}ms`
+                : `Request aborted by client and ACP session/cancel did not settle within ${CANCEL_SETTLE_TIMEOUT_MS}ms`;
+
+            reject(
+              new PromptInterruptedError(msg, {
+                isTimeout: reason === "timeout",
+                isClientAbort: reason === "abort",
+                cancelSettled: false,
+                promptSent: true,
+              })
+            );
+          }, CANCEL_SETTLE_TIMEOUT_MS);
+        };
+
+        const requestTimer = setTimeout(() => {
+          markCancelStart("timeout");
+        }, timeoutMs);
+
+        const onAbort = () => {
+          markCancelStart("abort");
+        };
+
+        if (abortSignal && !abortSignal.aborted) {
+          abortSignal.addEventListener("abort", onAbort, { once: true });
+        }
+
+        this.pendingRpcs.set(rpcId, {
+          timer: requestTimer,
+          resolve: (rpcResult: AcpPromptResult) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            this.cancellingSessions.delete(sessionId);
+
+            if (interruptReason !== null) {
+              const msg =
+                interruptReason === "timeout"
+                  ? `ACP RPC 'session/prompt' timed out after ${timeoutMs}ms`
+                  : "Request aborted by client";
+              reject(
+                new PromptInterruptedError(msg, {
+                  isTimeout: interruptReason === "timeout",
+                  isClientAbort: interruptReason === "abort",
+                  cancelSettled: true,
+                  promptSent: true,
+                })
+              );
+              return;
+            }
+
+            resolve(rpcResult);
+          },
+          reject: (rpcErr: Error) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            this.cancellingSessions.delete(sessionId);
+
+            const workerAlive = this.state !== "DEAD";
+            if (interruptReason !== null) {
+              const msg =
+                interruptReason === "timeout"
+                  ? `ACP RPC 'session/prompt' timed out after ${timeoutMs}ms`
+                  : "Request aborted by client";
+              reject(
+                new PromptInterruptedError(msg, {
+                  isTimeout: interruptReason === "timeout",
+                  isClientAbort: interruptReason === "abort",
+                  cancelSettled: workerAlive,
+                  promptSent: true,
+                })
+              );
+              return;
+            }
+
+            reject(rpcErr);
+          },
+        });
+
+        this.writeJson({
+          jsonrpc: "2.0",
+          id: rpcId,
+          method: "session/prompt",
+          params: {
+            sessionId,
+            prompt: [{ type: "text", text: promptText }],
+          },
+        });
+
+        if (abortSignal?.aborted) {
+          onAbort();
+        }
+      });
 
       const endTime = Date.now();
       const durationMs = endTime - startTime;
@@ -286,9 +560,6 @@ export class AcpWorker {
         actualModelVersion,
       };
     } finally {
-      if (abortSignal) {
-        abortSignal.removeEventListener("abort", onAbort);
-      }
       this.activeStreamListeners.delete(sessionId);
       this.lastUsedAt = Date.now();
     }
@@ -315,6 +586,8 @@ export class AcpWorker {
   public async closeSession(sessionId: string): Promise<void> {
     if (!this.activeSessions.has(sessionId)) return;
     this.activeSessions.delete(sessionId);
+    this.cancellingSessions.delete(sessionId);
+    this.cancelListeners.delete(sessionId);
     this.sessionAssignedModel.delete(sessionId);
     this.sessionConfirmedConfig.delete(sessionId);
     telemetryStore.markSessionClosed(sessionId);
@@ -333,8 +606,11 @@ export class AcpWorker {
     this.pendingRpcs.clear();
     this.activeStreamListeners.clear();
     this.activeSessions.clear();
+    this.cancellingSessions.clear();
+    this.cancelListeners.clear();
     this.sessionAssignedModel.clear();
     this.sessionConfirmedConfig.clear();
+    this.notifyIdle();
 
     this.sniffer.stop();
 
@@ -528,8 +804,11 @@ export class AcpWorker {
     this.pendingRpcs.clear();
     this.activeStreamListeners.clear();
     this.activeSessions.clear();
+    this.cancellingSessions.clear();
+    this.cancelListeners.clear();
     this.sessionAssignedModel.clear();
     this.sessionConfirmedConfig.clear();
+    this.notifyIdle();
     this.sniffer.stop();
     cleanupWorkerSandbox(this.sandbox);
     this.onDeathCallback?.(this.id);

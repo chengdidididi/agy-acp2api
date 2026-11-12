@@ -113,6 +113,8 @@ function serializeSingleMessage(msg: OpenAIMessage): string {
 
 /**
  * Compiles full conversation history when creating a brand new ACP session (Cache Miss).
+ * Prior turns are fenced inside `<conversation_history>` and the trailing user message
+ * always retains an explicit `[USER]` tag so historical turns and active user input never blend.
  */
 export function compileFullPrompt(
   messages: OpenAIMessage[],
@@ -122,7 +124,7 @@ export function compileFullPrompt(
   const systemPromptAppend = buildSystemPromptAppend(messages, tools, toolChoice);
   const nonSystem = messages.filter((m) => m.role !== "system" && m.role !== "developer");
 
-  // Single user message fast-path
+  // Single user message fast-path (zero wrapper overhead on Turn 1)
   if (nonSystem.length === 1 && nonSystem[0].role === "user") {
     return {
       systemPromptAppend,
@@ -130,28 +132,80 @@ export function compileFullPrompt(
     };
   }
 
-  // Multi-turn transcript serialization
-  const transcriptLines: string[] = [];
-  for (let i = 0; i < nonSystem.length; i++) {
-    const m = nonSystem[i];
-    const body = serializeSingleMessage(m);
-    if (i === nonSystem.length - 1 && m.role === "user") {
-      transcriptLines.push(body);
-    } else {
-      transcriptLines.push(`[${m.role.toUpperCase()}]\n${body}`);
+  let lastUserIdx = -1;
+  for (let i = nonSystem.length - 1; i >= 0; i--) {
+    if (nonSystem[i].role === "user") {
+      lastUserIdx = i;
+      break;
     }
   }
 
+  const formatTaggedMessage = (m: OpenAIMessage): string => {
+    const body = serializeSingleMessage(m);
+    if (m.role === "tool") {
+      return body;
+    }
+    return `[${m.role.toUpperCase()}]\n${body}`;
+  };
+
+  if (lastUserIdx > 0) {
+    const historyBlock = nonSystem
+      .slice(0, lastUserIdx)
+      .map(formatTaggedMessage)
+      .join("\n\n");
+    const activeTurnBlock = nonSystem
+      .slice(lastUserIdx)
+      .map(formatTaggedMessage)
+      .join("\n\n");
+
+    return {
+      systemPromptAppend,
+      promptText: `<conversation_history>\n${historyBlock}\n</conversation_history>\n\n${activeTurnBlock}`,
+    };
+  }
+
+  // Fallback when all messages belong to Turn 1 (e.g. [user, assistant(tool_call), tool])
   return {
     systemPromptAppend,
-    promptText: transcriptLines.join("\n\n"),
+    promptText: nonSystem.map(formatTaggedMessage).join("\n\n"),
   };
 }
 
 /**
  * Compiles ONLY the delta messages (e.g. `<tool_response>` or latest user message)
- * when a Session Prefix Hash hits an existing warm ACP session!
+ * when a Session Anchor + Bookmark match hits an existing warm ACP session.
  */
-export function compileDeltaPrompt(deltaMessages: OpenAIMessage[]): string {
-  return deltaMessages.map((m) => serializeSingleMessage(m)).join("\n\n");
+export function compileDeltaPrompt(
+  deltaMessages: OpenAIMessage[],
+  isRetryAfterInterrupt: boolean = false
+): string {
+  if (deltaMessages.length === 0) {
+    return "";
+  }
+
+  // Pure tool responses (single or parallel tool results)
+  if (deltaMessages.every((m) => m.role === "tool")) {
+    return deltaMessages.map((m) => serializeSingleMessage(m)).join("\n\n");
+  }
+
+  // Standard single user follow-up on a clean session
+  if (
+    deltaMessages.length === 1 &&
+    deltaMessages[0].role === "user" &&
+    !isRetryAfterInterrupt
+  ) {
+    return serializeSingleMessage(deltaMessages[0]);
+  }
+
+  // Mixed delta (e.g. cancelled <tool_response> + new user message, multi-message catch-up,
+  // or retry after an interrupted/cancelled turn): explicitly tag [USER] / [ASSISTANT] roles.
+  return deltaMessages
+    .map((m) => {
+      const body = serializeSingleMessage(m);
+      if (m.role === "tool") {
+        return body;
+      }
+      return `[${m.role.toUpperCase()}]\n${body}`;
+    })
+    .join("\n\n");
 }

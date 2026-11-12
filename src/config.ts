@@ -32,10 +32,10 @@ const defaultConfig: GatewayConfig = {
   minWorkers: parseInt(process.env.AGY_MIN_WORKERS || "1", 10),
   maxWorkers: parseInt(process.env.AGY_MAX_WORKERS || "6", 10),
   workerIdleTtlMs: parseInt(
-    process.env.AGY_WORKER_IDLE_TTL_MS || "180000",
+    process.env.AGY_WORKER_IDLE_TTL_MS || "1800000",
     10
   ),
-  sessionTtlMs: parseInt(process.env.AGY_SESSION_TTL_MS || "600000", 10),
+  sessionTtlMs: parseInt(process.env.AGY_SESSION_TTL_MS || "1800000", 10),
   requestTimeoutMs: parseInt(
     process.env.AGY_REQUEST_TIMEOUT_MS || "300000",
     10

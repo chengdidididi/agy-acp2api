@@ -5,8 +5,8 @@
   "exposeVariantModelsInList": false,
   "minWorkers": 1,
   "maxWorkers": 2,
-  "workerIdleTtlMs": 180000,
-  "sessionTtlMs": 600000,
+  "workerIdleTtlMs": 1800000,
+  "sessionTtlMs": 1800000,
   "requestTimeoutMs": 300000,
   "uiLayout": "side"
 }

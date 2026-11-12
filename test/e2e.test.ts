@@ -10,6 +10,11 @@ import {
   stripModelThinkingSuffix,
 } from "../src/compiler/model-resolver.js";
 import {
+  compileDeltaPrompt,
+  compileFullPrompt,
+} from "../src/compiler/prompt-compiler.js";
+import { SessionAffinityRegistry } from "../src/compiler/session-hash.js";
+import {
    TelemetryStore,
   telemetryStore,
 } from "../src/telemetry/metrics-store.js";
@@ -198,6 +203,168 @@ function testUnifiedModelAndEffortResolverUnit() {
   );
 }
 
+function testSessionAnchorAndPromptFramingUnit() {
+  console.log(
+    "2b. [Unit Test] Testing Anchor Session Matching, Health Circuit Breakers & [USER] Prompt Framing..."
+  );
+
+  // 1. Prompt compiler framing checks
+  const singleTurn = compileFullPrompt([
+    { role: "system", content: "Be concise." },
+    { role: "user", content: "Hello world!" },
+  ]);
+  assert.equal(singleTurn.promptText, "Hello world!");
+
+  const multiTurn = compileFullPrompt([
+    { role: "system", content: "Be concise." },
+    { role: "user", content: "First question" },
+    { role: "assistant", content: "First answer" },
+    { role: "user", content: "Second question — do NOT skip me" },
+  ]);
+  assert.ok(multiTurn.promptText.includes("<conversation_history>"));
+  assert.ok(multiTurn.promptText.includes("</conversation_history>"));
+  assert.ok(
+    multiTurn.promptText.endsWith("[USER]\nSecond question — do NOT skip me")
+  );
+
+  const mixedDelta = compileDeltaPrompt([
+    { role: "tool", tool_call_id: "c1", name: "roll_dice", content: "cancelled" },
+    { role: "user", content: "Switch topic now!" },
+  ]);
+  assert.ok(mixedDelta.includes("<tool_response"));
+  assert.ok(mixedDelta.includes("[USER]\nSwitch topic now!"));
+
+  const retryDelta = compileDeltaPrompt(
+    [{ role: "user", content: "Retried after timeout" }],
+    true
+  );
+  assert.equal(retryDelta, "[USER]\nRetried after timeout");
+
+  // 2. Anchor matching + stripped historical tool_calls + circuit breakers
+  const reg = new SessionAffinityRegistry(1_800_000);
+  const invalidated: Array<{ sessionId: string; reason: string }> = [];
+  const callbacks = {
+    isSessionAlive: () => true,
+    isWorkerIdle: () => true,
+    onInvalidateSession: (_wId: string, sId: string, reason: string) => {
+      invalidated.push({ sessionId: sId, reason });
+    },
+  };
+
+  // Turn 1 starts with tool_call, then completes with text reply
+  const turn1WithTool: OpenAIMessage[] = [
+    { role: "system", content: "RP system prompt v1" },
+    { role: "user", content: "Start adventure" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: "tc_1",
+          type: "function",
+          function: { name: "roll", arguments: '{"sides":20}' },
+        },
+      ],
+    },
+  ];
+  reg.registerTurnState("gemini-4-carbon", undefined, turn1WithTool, "w1", "s1", 1200);
+
+  const turn1Final: OpenAIMessage[] = [
+    ...turn1WithTool,
+    { role: "tool", tool_call_id: "tc_1", name: "roll", content: "18" },
+    { role: "assistant", content: "You rolled 18 and enter the tavern." },
+  ];
+  reg.registerTurnState("gemini-4-carbon", undefined, turn1Final, "w1", "s1", 1500);
+
+  // Client strips historical tool_calls & modifies dynamic system prompt timestamp, then sends Turn 2!
+  const clientStrippedHistory: OpenAIMessage[] = [
+    { role: "system", content: "RP system prompt v2 (timestamp changed!)" },
+    { role: "user", content: "Start adventure" },
+    { role: "assistant", content: "You rolled 18 and enter the tavern." },
+    { role: "user", content: "Talk to the innkeeper" },
+  ];
+  const hitAfterStrip = reg.findBestMatchingPrefix(
+    "gemini-4-carbon",
+    undefined,
+    clientStrippedHistory,
+    callbacks
+  );
+  assert.ok(hitAfterStrip, "Expected anchor HIT even when historical tool_calls were stripped");
+  assert.equal(hitAfterStrip!.entry.sessionId, "s1");
+  assert.equal(hitAfterStrip!.deltaMessages.length, 1);
+  assert.equal(hitAfterStrip!.deltaMessages[0].content, "Talk to the innkeeper");
+  assert.equal(hitAfterStrip!.isRetryAfterInterrupt, false);
+
+  // Simulate 1st timeout/abort with partial reply: session stays alive, retry hits with isRetryAfterInterrupt=true
+  const abort1 = reg.recordTurnInterruption("s1", {
+    role: "assistant",
+    content: "The innkeeper looks up and—",
+  });
+  assert.equal(abort1.shouldDestroy, false);
+  assert.equal(abort1.consecutiveAborts, 1);
+
+  // Case A: Client kept partial assistant reply and user sent a new message
+  const retryWithPartialKept: OpenAIMessage[] = [
+    ...clientStrippedHistory,
+    { role: "assistant", content: "The innkeeper looks up and—" },
+    { role: "user", content: "Actually, inspect the noticeboard instead" },
+  ];
+  const hitAfterAbort1 = reg.findBestMatchingPrefix(
+    "gemini-4-carbon",
+    undefined,
+    retryWithPartialKept,
+    callbacks
+  );
+  assert.ok(hitAfterAbort1);
+  assert.equal(hitAfterAbort1!.isRetryAfterInterrupt, true);
+  assert.equal(hitAfterAbort1!.deltaMessages.length, 1);
+  assert.equal(
+    hitAfterAbort1!.deltaMessages[0].content,
+    "Actually, inspect the noticeboard instead"
+  );
+
+  // Simulate 2nd consecutive abort -> circuit breaker destroys poisoned session!
+  const abort2 = reg.recordTurnInterruption("s1");
+  assert.equal(abort2.shouldDestroy, true);
+  assert.equal(abort2.consecutiveAborts, 2);
+  assert.equal(
+    reg.findBestMatchingPrefix("gemini-4-carbon", undefined, clientStrippedHistory, callbacks),
+    null
+  );
+
+  // Verify history rewind detection (user deleted lastSyncedAssistant turn)
+  reg.registerTurnState(
+    "gemini-4-carbon",
+    undefined,
+    [
+      ...clientStrippedHistory,
+      { role: "assistant", content: "The innkeeper greets you warmly." },
+    ],
+    "w1",
+    "s2",
+    2000
+  );
+  const rewoundHistory: OpenAIMessage[] = [
+    { role: "user", content: "Start adventure" },
+    { role: "assistant", content: "You rolled 18 and enter the tavern." },
+    { role: "user", content: "Rewound Turn 2 completely!" },
+  ];
+  const rewindMatch = reg.findBestMatchingPrefix(
+    "gemini-4-carbon",
+    undefined,
+    rewoundHistory,
+    callbacks
+  );
+  assert.equal(rewindMatch, null);
+  assert.ok(
+    invalidated.some((x) => x.sessionId === "s2" && x.reason === "history_rewound")
+  );
+
+  console.log(
+    "   -> Passed! Anchor matching, tool-strip tolerance, 2-strike abort breaker, rewind guard & [USER] framing verified."
+  );
+}
+
 async function consumeSseStream(res: Response): Promise<{
   content: string;
   toolCalls: OpenAIToolCallDelta[];
@@ -253,6 +420,7 @@ async function consumeSseStream(res: Response): Promise<{
 async function runIntegrationTest() {
   testSlidingWindowParserUnit();
   testUnifiedModelAndEffortResolverUnit();
+  testSessionAnchorAndPromptFramingUnit();
 
   console.log("\n3. [E2E Test] Booting WorkerPool and Hono Gateway Server...");
   const pool = new WorkerPool();
@@ -462,6 +630,7 @@ async function runIntegrationTest() {
     const dashHtml = await dashRes.text();
     assert.ok(dashHtml.includes("agy2api"));
     assert.ok(dashHtml.includes("顶部 CPA 适配"));
+    assert.ok(dashHtml.includes("ttl-hint"));
 
     const overviewRes = await fetch(`${baseUrl}/api/admin/overview`);
     const overview = (await overviewRes.json()) as any;
@@ -488,6 +657,83 @@ async function runIntegrationTest() {
     assert.ok(
       overview.telemetry.recentRequests[1].actualModelVersion.includes("gemini-3.8-flash")
     );
+
+    console.log(
+      "\n8. [E2E Turn 3 — Client Abort (`session/cancel`) & Immediate Retry Session Reuse]..."
+    );
+    messages.push({
+      role: "assistant",
+      content: turn2.content,
+    });
+
+    const abortCtrl = new AbortController();
+    const resAbort = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-3.8-flash(low)",
+        messages: [
+          ...messages,
+          {
+            role: "user",
+            content:
+              "Write a detailed 400-word travel guide about Shanghai weather and seasons.",
+          },
+        ],
+        tools,
+        stream: true,
+      }),
+      signal: abortCtrl.signal,
+    });
+    assert.equal(resAbort.status, 200);
+    assert.equal(resAbort.headers.get("X-Agy2Api-Session-Cache"), "HIT");
+    assert.equal(resAbort.headers.get("X-Agy2Api-Session-Id"), sessionId1);
+
+    // Let `session/prompt` enter in-flight generation, then abort to trigger `session/cancel` and IMMEDIATELY retry!
+    await new Promise((r) => setTimeout(r, 300));
+    abortCtrl.abort();
+    try {
+      await resAbort.body?.cancel();
+    } catch {}
+
+    const resRetry = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-3.8-flash(low)",
+        messages: [
+          ...messages,
+          {
+            role: "user",
+            content:
+              "Reply with ONLY the exact secret weather code for Shanghai from earlier.",
+          },
+        ],
+        tools,
+        stream: true,
+      }),
+    });
+    assert.equal(resRetry.status, 200);
+    const retryCache = resRetry.headers.get("X-Agy2Api-Session-Cache");
+    const retrySessionId = resRetry.headers.get("X-Agy2Api-Session-Id");
+    console.log(
+      `   -> Post-Abort Immediate Retry Headers: Cache=${retryCache}, SessionId=${retrySessionId}`
+    );
+    assert.equal(retryCache, "HIT");
+    assert.equal(retrySessionId, sessionId1);
+
+    const retryTurn = await consumeSseStream(resRetry);
+    console.log(
+      "   -> Post-Abort Retry Content:",
+      JSON.stringify(retryTurn.content)
+    );
+    assert.ok(retryTurn.content.includes("OMEGA-SH-7749"));
 
     console.log("\nALL UNIT & E2E TESTS PASSED SUCCESSFULLY!");
   } finally {

@@ -3,7 +3,7 @@ import { config, onConfigChange } from "../config.js";
 import { SessionAffinityRegistry } from "../compiler/session-hash.js";
 import { AcpModelInfo } from "../types/acp.js";
 import { OpenAIMessage, OpenAIToolDefinition } from "../types/openai.js";
-import { AcpWorker } from "./acp-worker.js";
+import { AcpWorker, PromptInterruptedError } from "./acp-worker.js";
 import { sweepStaleSandboxes } from "./sandbox.js";
 
 export interface LeaseAcquisition {
@@ -12,6 +12,7 @@ export interface LeaseAcquisition {
   isReusedSession: boolean;
   deltaMessages: OpenAIMessage[];
   matchedPrefixLength: number;
+  isRetryAfterInterrupt: boolean;
 }
 
 interface QueuedWaiter {
@@ -49,7 +50,9 @@ export class WorkerPool {
   constructor() {
     this.sessionRegistry = new SessionAffinityRegistry(config.sessionTtlMs);
     onConfigChange((newCfg) => {
-      this.sessionRegistry.setTtlMs(newCfg.sessionTtlMs);
+      this.sessionRegistry.setTtlMs(newCfg.sessionTtlMs, (wId, sId) => {
+        this.workers.get(wId)?.closeSession(sId).catch(() => {});
+      });
       this.ensureMinWorkers();
       this.reapIdleBurstWorkers();
     });
@@ -72,22 +75,50 @@ export class WorkerPool {
 
   /**
    * Acquires a worker for the given OpenAI request.
-   * Uses `baseModelId` for Session Prefix Hash affinity so changing `reasoning_effort`
-   * mid-conversation still hits the warm session!
+   * Uses `baseModelId` + `(firstUser + firstAssistant)` anchoring so changing `reasoning_effort`,
+   * retrying after a timeout/abort (`session/cancel`), or stripping historical `tool_calls`
+   * still hits the warm ACP session.
    */
   public async acquireForRequest(
     baseModelId: string,
     tools: OpenAIToolDefinition[] | undefined,
     messages: OpenAIMessage[]
   ): Promise<LeaseAcquisition> {
-    // 1. Check Session Prefix Hash affinity
+    // 0. If the matching warm session is currently settling `session/cancel` from an
+    // aborted/timed-out request right before this retry, wait briefly for it to become IDLE.
+    const candidates = this.sessionRegistry.findCandidateEntries(
+      baseModelId,
+      messages
+    );
+    if (candidates.length > 0) {
+      const top = candidates[0];
+      const candidateWorker = this.workers.get(top.workerId);
+      if (
+        candidateWorker &&
+        candidateWorker.state === "BUSY" &&
+        candidateWorker.hasSession(top.sessionId)
+      ) {
+        await candidateWorker.waitForSessionSettle(top.sessionId, 3500, 1000);
+      }
+    }
+
+    // 1. Check Session Anchor + Bookmark affinity & health checks
     const match = this.sessionRegistry.findBestMatchingPrefix(
       baseModelId,
       tools,
       messages,
-      (workerId, sessionId) => {
-        const w = this.workers.get(workerId);
-        return Boolean(w && w.state === "IDLE" && w.hasSession(sessionId));
+      {
+        isSessionAlive: (workerId, sessionId) => {
+          const w = this.workers.get(workerId);
+          return Boolean(w && w.state !== "DEAD" && w.hasSession(sessionId));
+        },
+        isWorkerIdle: (workerId) => {
+          const w = this.workers.get(workerId);
+          return Boolean(w && w.state === "IDLE");
+        },
+        onInvalidateSession: (workerId, sessionId) => {
+          this.workers.get(workerId)?.closeSession(sessionId).catch(() => {});
+        },
       }
     );
 
@@ -101,22 +132,35 @@ export class WorkerPool {
         isReusedSession: true,
         deltaMessages: match.deltaMessages,
         matchedPrefixLength: match.matchedPrefixLength,
+        isRetryAfterInterrupt: match.isRetryAfterInterrupt,
       };
     }
 
-    // 2. Cache Miss: find any IDLE worker
+    // 2. Cache Miss: pick the IDLE worker holding the fewest active sessions
+    let bestIdleWorker: AcpWorker | null = null;
+    let bestIdleSessionCount = Infinity;
     for (const worker of this.workers.values()) {
       if (worker.state === "IDLE") {
-        worker.state = "BUSY";
-        worker.lastUsedAt = Date.now();
-        return {
-          worker,
-          sessionId: null,
-          isReusedSession: false,
-          deltaMessages: messages,
-          matchedPrefixLength: 0,
-        };
+        const count = this.sessionRegistry.countSessionsForWorker(worker.id);
+        if (count < bestIdleSessionCount) {
+          bestIdleWorker = worker;
+          bestIdleSessionCount = count;
+          if (count === 0) break;
+        }
       }
+    }
+
+    if (bestIdleWorker) {
+      bestIdleWorker.state = "BUSY";
+      bestIdleWorker.lastUsedAt = Date.now();
+      return {
+        worker: bestIdleWorker,
+        sessionId: null,
+        isReusedSession: false,
+        deltaMessages: messages,
+        matchedPrefixLength: 0,
+        isRetryAfterInterrupt: false,
+      };
     }
 
     // 3. All current workers are busy: spawn a burst worker if below maxWorkers
@@ -130,6 +174,7 @@ export class WorkerPool {
         isReusedSession: false,
         deltaMessages: messages,
         matchedPrefixLength: 0,
+        isRetryAfterInterrupt: false,
       };
     }
 
@@ -143,7 +188,52 @@ export class WorkerPool {
       isReusedSession: false,
       deltaMessages: messages,
       matchedPrefixLength: 0,
+      isRetryAfterInterrupt: false,
     };
+  }
+
+  /**
+   * Evaluates session health after a timeout, client abort, or RPC error:
+   * - Hung `session/cancel` (`!cancelSettled`) -> destroys hung worker;
+   * - Pre-prompt abort on a brand-new session -> closes unused session;
+   * - 1st settled interruption on a warm session -> keeps session alive for KV-cached retry;
+   * - 2nd consecutive interruption (or Turn 1 failure) -> closes poisoned session.
+   */
+  public async handleFailedTurnSession(
+    worker: AcpWorker,
+    sessionId: string | null,
+    isReusedSession: boolean,
+    err: unknown,
+    partialAssistantMsg?: OpenAIMessage
+  ): Promise<void> {
+    if (!sessionId) return;
+
+    if (worker.state === "DEAD") {
+      this.sessionRegistry.removeWorkerSessions(worker.id);
+      return;
+    }
+
+    if (err instanceof PromptInterruptedError) {
+      if (!err.cancelSettled) {
+        this.sessionRegistry.removeSession(sessionId);
+        this.terminateWorker(worker.id);
+        return;
+      }
+      if (!err.promptSent) {
+        if (!isReusedSession) {
+          await this.closeWorkerSession(worker.id, sessionId);
+        }
+        return;
+      }
+    }
+
+    const { shouldDestroy } = this.sessionRegistry.recordTurnInterruption(
+      sessionId,
+      partialAssistantMsg
+    );
+    if (shouldDestroy) {
+      await this.closeWorkerSession(worker.id, sessionId);
+    }
   }
 
   public releaseWorker(worker: AcpWorker): void {
@@ -154,6 +244,27 @@ export class WorkerPool {
 
     if (worker.availableModels.length > 0) {
       this.cachedModels = worker.availableModels;
+    }
+
+    // Give priority to an immediate affinity retry waiting on this specific session's cancel-settle
+    if (worker.hasIdleWaiters()) {
+      worker.state = "IDLE";
+      worker.lastUsedAt = Date.now();
+      worker.notifyIdle();
+      queueMicrotask(() => {
+        if (
+          worker.state === "IDLE" &&
+          this.workers.has(worker.id) &&
+          this.waitQueue.length > 0
+        ) {
+          const waiter = this.waitQueue.shift()!;
+          clearTimeout(waiter.timer);
+          worker.state = "BUSY";
+          worker.lastUsedAt = Date.now();
+          waiter.resolve(worker);
+        }
+      });
+      return;
     }
 
     while (this.waitQueue.length > 0) {
@@ -167,6 +278,7 @@ export class WorkerPool {
 
     worker.state = "IDLE";
     worker.lastUsedAt = Date.now();
+    worker.notifyIdle();
   }
 
   public getAvailableModels(): AcpModelInfo[] {
@@ -298,6 +410,10 @@ export class WorkerPool {
   }
 
   private reapIdleBurstWorkers(): void {
+    this.sessionRegistry.pruneExpired((wId, sId) => {
+      this.workers.get(wId)?.closeSession(sId).catch(() => {});
+    });
+
     if (this.workers.size <= config.minWorkers) return;
 
     const now = Date.now();
@@ -305,7 +421,8 @@ export class WorkerPool {
       if (this.workers.size <= config.minWorkers) break;
       if (
         worker.state === "IDLE" &&
-        now - worker.lastUsedAt > config.workerIdleTtlMs
+        now - worker.lastUsedAt > config.workerIdleTtlMs &&
+        !this.sessionRegistry.hasActiveSessionsForWorker(id)
       ) {
         this.workers.delete(id);
         this.sessionRegistry.removeWorkerSessions(id);
