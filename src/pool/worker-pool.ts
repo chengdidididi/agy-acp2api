@@ -1,6 +1,9 @@
 import crypto from "node:crypto";
 import { config, onConfigChange } from "../config.js";
-import { SessionAffinityRegistry } from "../compiler/session-hash.js";
+import {
+  SessionAffinityRegistry,
+  computeToolsSignature,
+} from "../compiler/session-hash.js";
 import { AcpModelInfo } from "../types/acp.js";
 import { OpenAIMessage, OpenAIToolDefinition } from "../types/openai.js";
 import { AcpWorker, PromptInterruptedError } from "./acp-worker.js";
@@ -84,21 +87,35 @@ export class WorkerPool {
     tools: OpenAIToolDefinition[] | undefined,
     messages: OpenAIMessage[]
   ): Promise<LeaseAcquisition> {
-    // 0. If the matching warm session is currently settling `session/cancel` from an
-    // aborted/timed-out request right before this retry, wait briefly for it to become IDLE.
+    // 0. If the matching warm session is currently settling `session/cancel` OR still
+    // running an old prompt on the exact same `sessionId` (lingering proxy stream),
+    // preempt it (`session/cancel`) and wait briefly for it to settle into IDLE.
     const candidates = this.sessionRegistry.findCandidateEntries(
       baseModelId,
-      messages
+      messages,
+      (wId, sId) =>
+        this.workers.get(wId)?.getCurrentPromptSessionId() === sId
     );
     if (candidates.length > 0) {
-      const top = candidates[0];
+      const incomingToolsSig = computeToolsSignature(tools);
+      const top =
+        candidates.find((c) => c.toolsSignature === incomingToolsSig) ??
+        candidates[0];
       const candidateWorker = this.workers.get(top.workerId);
       if (
         candidateWorker &&
         candidateWorker.state === "BUSY" &&
         candidateWorker.hasSession(top.sessionId)
       ) {
-        await candidateWorker.waitForSessionSettle(top.sessionId, 3500, 1000);
+        if (
+          candidateWorker.getCurrentPromptSessionId() === top.sessionId &&
+          this.sessionRegistry.hasValidBookmarkForEntry(top, tools, messages)
+        ) {
+          candidateWorker.preemptSession(top.sessionId);
+          await candidateWorker.waitForSessionSettle(top.sessionId, 3500, 3500);
+        } else {
+          await candidateWorker.waitForSessionSettle(top.sessionId, 3500, 1000);
+        }
       }
     }
 
@@ -196,15 +213,17 @@ export class WorkerPool {
    * Evaluates session health after a timeout, client abort, or RPC error:
    * - Hung `session/cancel` (`!cancelSettled`) -> destroys hung worker;
    * - Pre-prompt abort on a brand-new session -> closes unused session;
-   * - 1st settled interruption on a warm session -> keeps session alive for KV-cached retry;
-   * - 2nd consecutive interruption (or Turn 1 failure) -> closes poisoned session.
+   * - Manual client cancel (`isClientAbort: true`) -> keeps session alive without incrementing error breaker;
+   * - 1st timeout/error on a warm session -> keeps session alive for KV-cached retry;
+   * - 2nd consecutive timeout/error (or Turn 1 error) -> closes poisoned session.
    */
   public async handleFailedTurnSession(
     worker: AcpWorker,
     sessionId: string | null,
     isReusedSession: boolean,
     err: unknown,
-    partialAssistantMsg?: OpenAIMessage
+    partialAssistantMsg?: OpenAIMessage,
+    lastUserMsg?: OpenAIMessage
   ): Promise<void> {
     if (!sessionId) return;
 
@@ -212,6 +231,9 @@ export class WorkerPool {
       this.sessionRegistry.removeWorkerSessions(worker.id);
       return;
     }
+
+    const isClientAbort =
+      err instanceof PromptInterruptedError && err.isClientAbort;
 
     if (err instanceof PromptInterruptedError) {
       if (!err.cancelSettled) {
@@ -229,7 +251,11 @@ export class WorkerPool {
 
     const { shouldDestroy } = this.sessionRegistry.recordTurnInterruption(
       sessionId,
-      partialAssistantMsg
+      {
+        isClientAbort,
+        lastUserMsg,
+        partialAssistantMsg,
+      }
     );
     if (shouldDestroy) {
       await this.closeWorkerSession(worker.id, sessionId);

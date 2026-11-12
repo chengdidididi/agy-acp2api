@@ -3,6 +3,7 @@ import { OpenAIMessage, OpenAIToolDefinition } from "../types/openai.js";
 
 export const MAX_CONSECUTIVE_SESSION_ABORTS = 2;
 export const MAX_SESSION_CONTEXT_TOKENS = 900_000;
+export const MAX_SYNCED_CHECKPOINTS = 6;
 
 export type SessionInvalidationReason =
   | "expired"
@@ -12,6 +13,13 @@ export type SessionInvalidationReason =
   | "context_limit"
   | "empty_delta";
 
+export interface SyncedTurnCheckpoint {
+  assistantFullFp: string;
+  assistantTextFp: string | null;
+  /** Fingerprint of the latest `user` message at or before this checkpoint */
+  triggerUserFp: string | null;
+}
+
 export interface SessionAffinityEntry {
   sessionId: string;
   workerId: string;
@@ -20,16 +28,24 @@ export interface SessionAffinityEntry {
   firstUserFp: string;
   firstAnyAssistantFp: string | null;
   firstTextAssistantFp: string | null;
-  lastSyncedAssistantFp: string;
+  lastSyncedAssistantFp: string | null;
   lastSyncedAssistantTextFp: string | null;
+  checkpoints: SyncedTurnCheckpoint[];
   lastAbortedAssistantFp: string | null;
   lastAbortedAssistantTextFp: string | null;
+  lastInterruptedUserFp: string | null;
   syncedTurnCount: number;
   consecutiveAborts: number;
   hasPendingInterruptedTurn: boolean;
   lastTotalTokens: number;
   messageCount: number;
   updatedAt: number;
+}
+
+export interface RecordInterruptionOptions {
+  isClientAbort?: boolean;
+  lastUserMsg?: OpenAIMessage;
+  partialAssistantMsg?: OpenAIMessage;
 }
 
 export interface PrefixMatchResult {
@@ -189,6 +205,7 @@ function extractConversationAnchors(nonSystem: OpenAIMessage[]): {
   firstUserFp: string;
   firstAnyAssistantFp: string | null;
   firstTextAssistantFp: string | null;
+  hasAssistantMessages: boolean;
 } | null {
   const firstUserIdx = nonSystem.findIndex((m) => m.role === "user");
   if (firstUserIdx === -1) return null;
@@ -214,28 +231,27 @@ function extractConversationAnchors(nonSystem: OpenAIMessage[]): {
     }
   }
 
-  if (!firstAnyAssistantFp && !firstTextAssistantFp) {
-    return null;
-  }
-
   return {
     firstUserFp,
     firstAnyAssistantFp,
     firstTextAssistantFp,
+    hasAssistantMessages: Boolean(firstAnyAssistantFp || firstTextAssistantFp),
   };
 }
 
 function findBookmarkIndex(
   nonSystem: OpenAIMessage[],
-  fullFp: string,
+  fullFp: string | null,
   textFp: string | null
 ): number {
-  // Pass 1: Exact assistant message match (text + tool_calls)
-  for (let i = nonSystem.length - 1; i >= 0; i--) {
-    const m = nonSystem[i];
-    if (m.role !== "assistant") continue;
-    if (computeAssistantFullFingerprint(m) === fullFp) {
-      return i;
+  if (fullFp) {
+    // Pass 1: Exact assistant message match (text + tool_calls)
+    for (let i = nonSystem.length - 1; i >= 0; i--) {
+      const m = nonSystem[i];
+      if (m.role !== "assistant") continue;
+      if (computeAssistantFullFingerprint(m) === fullFp) {
+        return i;
+      }
     }
   }
 
@@ -252,6 +268,159 @@ function findBookmarkIndex(
   }
 
   return -1;
+}
+
+interface SliceResolution {
+  sliceStartIdx: number;
+  deltaMessages: OpenAIMessage[];
+  isFallbackOrInterrupt: boolean;
+}
+
+function resolveEntrySlice(
+  entry: SessionAffinityEntry,
+  nonSystem: OpenAIMessage[]
+): SliceResolution | null {
+  const hasAssistantInIncoming = nonSystem.some((m) => m.role === "assistant");
+
+  // Case 0: Session was pre-registered on Turn 1 (`session/new`) and interrupted before
+  // any assistant reply completed (`checkpoints.length === 0`).
+  if (entry.checkpoints.length === 0) {
+    if (hasAssistantInIncoming) return null;
+    let sliceStartIdx = 0;
+    if (
+      entry.lastInterruptedUserFp &&
+      nonSystem.length > 1 &&
+      nonSystem[0].role === "user" &&
+      computeUserFingerprint(nonSystem[0]) === entry.lastInterruptedUserFp
+    ) {
+      sliceStartIdx = 1;
+    }
+    const deltaMessages = nonSystem.slice(sliceStartIdx);
+    if (deltaMessages.length === 0) return null;
+    return {
+      sliceStartIdx,
+      deltaMessages,
+      isFallbackOrInterrupt: entry.hasPendingInterruptedTurn,
+    };
+  }
+
+  // Case 1: Match the latest synced checkpoint (standard fast path)
+  const latest = entry.checkpoints[entry.checkpoints.length - 1];
+  const latestIdx = findBookmarkIndex(
+    nonSystem,
+    latest.assistantFullFp,
+    latest.assistantTextFp
+  );
+
+  if (latestIdx !== -1) {
+    let sliceStartIdx = latestIdx + 1;
+
+    if (entry.hasPendingInterruptedTurn) {
+      // Advance past truncated partial assistant reply if client preserved it
+      if (entry.lastAbortedAssistantFp || entry.lastAbortedAssistantTextFp) {
+        const trailingSlice = nonSystem.slice(sliceStartIdx);
+        const abortedRelIdx = findBookmarkIndex(
+          trailingSlice,
+          entry.lastAbortedAssistantFp,
+          entry.lastAbortedAssistantTextFp
+        );
+        if (abortedRelIdx !== -1 && abortedRelIdx < trailingSlice.length - 1) {
+          sliceStartIdx += abortedRelIdx + 1;
+        }
+      }
+
+      // If client kept the cancelled user message (`U4`) and appended a corrected user message (`U5`),
+      // skip the already-sent `U4` so `agy acp` only receives `U5`.
+      if (entry.lastInterruptedUserFp) {
+        const trailingAfter = nonSystem.slice(sliceStartIdx);
+        if (
+          trailingAfter.length > 1 &&
+          trailingAfter[0].role === "user" &&
+          computeUserFingerprint(trailingAfter[0]) ===
+            entry.lastInterruptedUserFp
+        ) {
+          sliceStartIdx += 1;
+        }
+      }
+    }
+
+    const deltaMessages = nonSystem.slice(sliceStartIdx);
+    if (deltaMessages.length === 0) return null;
+    return {
+      sliceStartIdx,
+      deltaMessages,
+      isFallbackOrInterrupt: entry.hasPendingInterruptedTurn,
+    };
+  }
+
+  // Case 2: Sliding bookmark fallback — handles frontend-cancel vs backend-finish race
+  // (e.g. backend finished short reply `A4` in ~2s and advanced bookmark, while frontend
+  // cancelled and discarded `A4`, keeping `A3`), as well as mid-turn tool-loop rollbacks.
+  for (let k = entry.checkpoints.length - 2; k >= 0; k--) {
+    const skipped = entry.checkpoints.slice(k + 1);
+    const skippedTextTurns = skipped.filter(
+      (c) => c.assistantTextFp !== null
+    ).length;
+    if (skippedTextTurns > 1) {
+      break;
+    }
+
+    const prev = entry.checkpoints[k];
+    const prevIdx = findBookmarkIndex(
+      nonSystem,
+      prev.assistantFullFp,
+      prev.assistantTextFp
+    );
+    if (prevIdx === -1) continue;
+
+    const trailingAfterPrev = nonSystem.slice(prevIdx + 1);
+    // Reject if there is a diverged assistant message after `prev`
+    if (trailingAfterPrev.some((m) => m.role === "assistant")) {
+      return null;
+    }
+
+    let sliceStartIdx = prevIdx + 1;
+    const nextCheckpoint = entry.checkpoints[k + 1];
+    if (
+      nextCheckpoint?.triggerUserFp &&
+      trailingAfterPrev.length > 1 &&
+      trailingAfterPrev[0].role === "user" &&
+      computeUserFingerprint(trailingAfterPrev[0]) ===
+        nextCheckpoint.triggerUserFp
+    ) {
+      // Backend already processed `trailingAfterPrev[0]` (e.g. `"就是"`), only send the new follow-up
+      sliceStartIdx += 1;
+    }
+
+    const deltaMessages = nonSystem.slice(sliceStartIdx);
+    if (deltaMessages.length === 0) return null;
+    return {
+      sliceStartIdx,
+      deltaMessages,
+      isFallbackOrInterrupt: true,
+    };
+  }
+
+  // Case 3: Turn-1 uncommitted tool-loop rollback where client sent `[U1, U2_continue]` (0 assistant messages)
+  if (!hasAssistantInIncoming && entry.firstTextAssistantFp === null) {
+    let sliceStartIdx = 0;
+    if (
+      nonSystem.length > 1 &&
+      nonSystem[0].role === "user" &&
+      computeUserFingerprint(nonSystem[0]) === entry.firstUserFp
+    ) {
+      sliceStartIdx = 1;
+    }
+    const deltaMessages = nonSystem.slice(sliceStartIdx);
+    if (deltaMessages.length === 0) return null;
+    return {
+      sliceStartIdx,
+      deltaMessages,
+      isFallbackOrInterrupt: true,
+    };
+  }
+
+  return null;
 }
 
 export class SessionAffinityRegistry {
@@ -298,13 +467,30 @@ export class SessionAffinityRegistry {
   }
 
   /**
+   * Checks whether an incoming request has matching `toolsSignature` and a valid non-empty
+   * delta slice for `entry` (used before preempting an in-flight session).
+   */
+  public hasValidBookmarkForEntry(
+    entry: SessionAffinityEntry,
+    tools: OpenAIToolDefinition[] | undefined,
+    messages: OpenAIMessage[]
+  ): boolean {
+    if (entry.consecutiveAborts >= MAX_CONSECUTIVE_SESSION_ABORTS) return false;
+    if (entry.lastTotalTokens >= MAX_SESSION_CONTEXT_TOKENS) return false;
+    if (entry.toolsSignature !== computeToolsSignature(tools)) return false;
+    const nonSystem = getNonSystemMessages(messages);
+    return resolveEntrySlice(entry, nonSystem) !== null;
+  }
+
+  /**
    * Peeks at candidate sessions matching `(baseModelId + firstUser + firstAssistant)`
-   * without mutating state. Used by `WorkerPool` to wait briefly if the owning worker
-   * is currently finishing a `session/cancel` settle from an aborted/retried turn.
+   * (or an interrupted/in-flight Turn-1 session when incoming has 0 assistant messages)
+   * without mutating state.
    */
   public findCandidateEntries(
     baseModelId: string,
-    messages: OpenAIMessage[]
+    messages: OpenAIMessage[],
+    isSessionRunning?: (workerId: string, sessionId: string) => boolean
   ): SessionAffinityEntry[] {
     const nonSystem = getNonSystemMessages(messages);
     const anchors = extractConversationAnchors(nonSystem);
@@ -313,7 +499,7 @@ export class SessionAffinityRegistry {
     const now = Date.now();
     const matches: Array<{
       entry: SessionAffinityEntry;
-      hasBookmark: boolean;
+      hasValidSlice: boolean;
     }> = [];
 
     for (const entry of this.sessions.values()) {
@@ -321,31 +507,39 @@ export class SessionAffinityRegistry {
       if (entry.modelId !== baseModelId) continue;
       if (entry.firstUserFp !== anchors.firstUserFp) continue;
 
-      const textAnchorMatched = Boolean(
-        anchors.firstTextAssistantFp &&
-          entry.firstTextAssistantFp &&
-          anchors.firstTextAssistantFp === entry.firstTextAssistantFp
-      );
-      const anyAnchorMatched = Boolean(
-        anchors.firstAnyAssistantFp &&
-          entry.firstAnyAssistantFp &&
-          anchors.firstAnyAssistantFp === entry.firstAnyAssistantFp
-      );
+      if (anchors.hasAssistantMessages) {
+        const textAnchorMatched = Boolean(
+          anchors.firstTextAssistantFp &&
+            entry.firstTextAssistantFp &&
+            anchors.firstTextAssistantFp === entry.firstTextAssistantFp
+        );
+        const anyAnchorMatched = Boolean(
+          anchors.firstAnyAssistantFp &&
+            entry.firstAnyAssistantFp &&
+            anchors.firstAnyAssistantFp === entry.firstAnyAssistantFp
+        );
 
-      if (!textAnchorMatched && !anyAnchorMatched) continue;
+        if (!textAnchorMatched && !anyAnchorMatched) continue;
+      } else {
+        // Incoming request has 0 assistant messages: ONLY match an uncommitted Turn-1 session
+        // that is either awaiting recovery after cancel/interrupt or still in-flight on that session.
+        const running =
+          isSessionRunning?.(entry.workerId, entry.sessionId) ?? false;
+        const canMatchTurn1 =
+          entry.firstTextAssistantFp === null &&
+          (entry.syncedTurnCount === 0 ||
+            entry.hasPendingInterruptedTurn ||
+            running);
+        if (!canMatchTurn1) continue;
+      }
 
-      const hasBookmark =
-        findBookmarkIndex(
-          nonSystem,
-          entry.lastSyncedAssistantFp,
-          entry.lastSyncedAssistantTextFp
-        ) !== -1;
-      matches.push({ entry, hasBookmark });
+      const hasValidSlice = resolveEntrySlice(entry, nonSystem) !== null;
+      matches.push({ entry, hasValidSlice });
     }
 
     matches.sort((a, b) => {
-      if (a.hasBookmark !== b.hasBookmark) {
-        return a.hasBookmark ? -1 : 1;
+      if (a.hasValidSlice !== b.hasValidSlice) {
+        return a.hasValidSlice ? -1 : 1;
       }
       return b.entry.updatedAt - a.entry.updatedAt;
     });
@@ -355,12 +549,12 @@ export class SessionAffinityRegistry {
 
   /**
    * Matches an incoming OpenAI `messages` array to an active ACP session using
-   * `(firstUser + firstAssistant)` anchoring + `lastSyncedAssistant` progress bookmark,
-   * while enforcing the 4 zero-cost session health checks:
-   *   1. Consecutive abort circuit breaker (`consecutiveAborts >= 2`)
-   *   2. Client history rewind / deletion detection (missing progress bookmark)
-   *   3. External tool definitions changed (`toolsSignature`)
-   *   4. Context window fullness guard (`lastTotalTokens >= MAX_SESSION_CONTEXT_TOKENS`)
+   * `(firstUser + firstAssistant)` anchoring + sliding `checkpoints` progress bookmarks,
+   * while enforcing zero-cost session health checks:
+   *   1. Consecutive error/timeout circuit breaker (`consecutiveAborts >= 2`)
+   *   2. External tool definitions match (`toolsSignature` — non-matching helper requests skip without destroying)
+   *   3. Context window fullness guard (`lastTotalTokens >= MAX_SESSION_CONTEXT_TOKENS`)
+   *   4. Sliding progress bookmark & deep history rewind detection
    */
   public findBestMatchingPrefix(
     baseModelId: string,
@@ -396,7 +590,7 @@ export class SessionAffinityRegistry {
         continue;
       }
 
-      // Health Check 1: Consecutive abort circuit breaker
+      // Health Check 1: Consecutive error/timeout circuit breaker
       if (entry.consecutiveAborts >= MAX_CONSECUTIVE_SESSION_ABORTS) {
         this.sessions.delete(entry.sessionId);
         cb.onInvalidateSession?.(
@@ -407,14 +601,9 @@ export class SessionAffinityRegistry {
         continue;
       }
 
-      // Health Check 2: External tool definitions changed mid-conversation
+      // Health Check 2: External tool definitions mismatch — skip without destroying so
+      // tool-less background helper requests (e.g. title generation) never nuke the main session.
       if (entry.toolsSignature !== incomingToolsSig) {
-        this.sessions.delete(entry.sessionId);
-        cb.onInvalidateSession?.(
-          entry.workerId,
-          entry.sessionId,
-          "tools_changed"
-        );
         continue;
       }
 
@@ -429,50 +618,22 @@ export class SessionAffinityRegistry {
         continue;
       }
 
-      // Health Check 4: Progress bookmark & client history rewind/deletion check
-      const bookmarkIdx = findBookmarkIndex(
-        nonSystem,
-        entry.lastSyncedAssistantFp,
-        entry.lastSyncedAssistantTextFp
-      );
-
-      if (bookmarkIdx === -1) {
+      // Health Check 4: Sliding progress bookmark & history rewind check
+      const resolved = resolveEntrySlice(entry, nonSystem);
+      if (!resolved) {
+        const hasAnyDeltaCandidate =
+          entry.checkpoints.length > 0 &&
+          findBookmarkIndex(
+            nonSystem,
+            entry.lastSyncedAssistantFp,
+            entry.lastSyncedAssistantTextFp
+          ) ===
+            nonSystem.length - 1;
         this.sessions.delete(entry.sessionId);
         cb.onInvalidateSession?.(
           entry.workerId,
           entry.sessionId,
-          "history_rewound"
-        );
-        continue;
-      }
-
-      let sliceStartIdx = bookmarkIdx + 1;
-
-      // If the previous attempt on this session was interrupted mid-stream and the client
-      // kept that truncated partial assistant message in history, advance past it so we
-      // don't resend partial assistant output that `agy acp` already generated.
-      if (
-        entry.hasPendingInterruptedTurn &&
-        (entry.lastAbortedAssistantFp || entry.lastAbortedAssistantTextFp)
-      ) {
-        const trailingSlice = nonSystem.slice(sliceStartIdx);
-        const abortedRelIdx = findBookmarkIndex(
-          trailingSlice,
-          entry.lastAbortedAssistantFp || "",
-          entry.lastAbortedAssistantTextFp
-        );
-        if (abortedRelIdx !== -1 && abortedRelIdx < trailingSlice.length - 1) {
-          sliceStartIdx += abortedRelIdx + 1;
-        }
-      }
-
-      const deltaMessages = nonSystem.slice(sliceStartIdx);
-      if (deltaMessages.length === 0) {
-        this.sessions.delete(entry.sessionId);
-        cb.onInvalidateSession?.(
-          entry.workerId,
-          entry.sessionId,
-          "empty_delta"
+          hasAnyDeltaCandidate ? "empty_delta" : "history_rewound"
         );
         continue;
       }
@@ -481,9 +642,9 @@ export class SessionAffinityRegistry {
       entry.updatedAt = Date.now();
       return {
         entry,
-        deltaMessages,
-        matchedPrefixLength: sliceStartIdx,
-        isRetryAfterInterrupt: entry.hasPendingInterruptedTurn,
+        deltaMessages: resolved.deltaMessages,
+        matchedPrefixLength: resolved.sliceStartIdx,
+        isRetryAfterInterrupt: resolved.isFallbackOrInterrupt,
       };
     }
 
@@ -491,8 +652,74 @@ export class SessionAffinityRegistry {
   }
 
   /**
+   * Pre-registers a brand-new ACP session immediately after `session/new` so that if
+   * the user cancels Turn 1 in-flight (or a second follow-up preempts a hung Turn 1 stream),
+   * the gateway can still locate, preempt, and reuse the warm Turn-1 session.
+   */
+  public registerInitialSession(
+    baseModelId: string,
+    tools: OpenAIToolDefinition[] | undefined,
+    initialMessages: OpenAIMessage[],
+    workerId: string,
+    sessionId: string
+  ): void {
+    const nonSystem = getNonSystemMessages(initialMessages);
+    const anchors = extractConversationAnchors(nonSystem);
+    if (!anchors) return;
+
+    const lastUser = [...nonSystem].reverse().find((m) => m.role === "user");
+    const lastUserFp = lastUser ? computeUserFingerprint(lastUser) : null;
+
+    const initialCheckpoints: SyncedTurnCheckpoint[] = [];
+    for (let i = 0; i < nonSystem.length; i++) {
+      const m = nonSystem[i];
+      if (m.role !== "assistant") continue;
+      let triggerUserFp: string | null = null;
+      for (let j = i - 1; j >= 0; j--) {
+        if (nonSystem[j].role === "user") {
+          triggerUserFp = computeUserFingerprint(nonSystem[j]);
+          break;
+        }
+      }
+      initialCheckpoints.push({
+        assistantFullFp: computeAssistantFullFingerprint(m),
+        assistantTextFp: computeAssistantTextFingerprint(m),
+        triggerUserFp,
+      });
+    }
+    const trimmedCheckpoints = initialCheckpoints.slice(-MAX_SYNCED_CHECKPOINTS);
+    const latestCp =
+      trimmedCheckpoints.length > 0
+        ? trimmedCheckpoints[trimmedCheckpoints.length - 1]
+        : null;
+
+    this.sessions.set(sessionId, {
+      sessionId,
+      workerId,
+      modelId: baseModelId,
+      toolsSignature: computeToolsSignature(tools),
+      firstUserFp: anchors.firstUserFp,
+      firstAnyAssistantFp: anchors.firstAnyAssistantFp,
+      firstTextAssistantFp: anchors.firstTextAssistantFp,
+      lastSyncedAssistantFp: latestCp?.assistantFullFp ?? null,
+      lastSyncedAssistantTextFp: latestCp?.assistantTextFp ?? null,
+      checkpoints: trimmedCheckpoints,
+      lastAbortedAssistantFp: null,
+      lastAbortedAssistantTextFp: null,
+      lastInterruptedUserFp: lastUserFp,
+      syncedTurnCount: trimmedCheckpoints.length,
+      consecutiveAborts: 0,
+      hasPendingInterruptedTurn: false,
+      lastTotalTokens: 0,
+      messageCount: nonSystem.length,
+      updatedAt: Date.now(),
+    });
+  }
+
+  /**
    * Registers or updates a live ACP session after a successful `session/prompt` turn,
-   * refreshing its TTL and resetting consecutive abort counters.
+   * appending to its sliding `checkpoints` window, refreshing its TTL, and resetting
+   * consecutive error abort counters.
    */
   public registerTurnState(
     baseModelId: string,
@@ -504,17 +731,44 @@ export class SessionAffinityRegistry {
   ): string {
     const nonSystem = getNonSystemMessages(fullMessagesWithReply);
     const anchors = extractConversationAnchors(nonSystem);
-    const lastAsst = [...nonSystem]
-      .reverse()
-      .find((m) => m.role === "assistant");
+    let lastAsstIdx = -1;
+    for (let i = nonSystem.length - 1; i >= 0; i--) {
+      if (nonSystem[i].role === "assistant") {
+        lastAsstIdx = i;
+        break;
+      }
+    }
 
-    if (!anchors || !lastAsst) {
+    if (!anchors || lastAsstIdx === -1) {
       return sessionId;
+    }
+
+    const lastAsst = nonSystem[lastAsstIdx];
+    let triggerUserFp: string | null = null;
+    for (let j = lastAsstIdx - 1; j >= 0; j--) {
+      if (nonSystem[j].role === "user") {
+        triggerUserFp = computeUserFingerprint(nonSystem[j]);
+        break;
+      }
     }
 
     const existing = this.sessions.get(sessionId);
     const lastSyncedAssistantFp = computeAssistantFullFingerprint(lastAsst);
     const lastSyncedAssistantTextFp = computeAssistantTextFingerprint(lastAsst);
+
+    const nextCheckpoint: SyncedTurnCheckpoint = {
+      assistantFullFp: lastSyncedAssistantFp,
+      assistantTextFp: lastSyncedAssistantTextFp,
+      triggerUserFp,
+    };
+
+    const prevCheckpoints = existing?.checkpoints || [];
+    const updatedCheckpoints =
+      prevCheckpoints.length > 0 &&
+      prevCheckpoints[prevCheckpoints.length - 1].assistantFullFp ===
+        lastSyncedAssistantFp
+        ? prevCheckpoints
+        : [...prevCheckpoints, nextCheckpoint].slice(-MAX_SYNCED_CHECKPOINTS);
 
     this.sessions.set(sessionId, {
       sessionId,
@@ -528,8 +782,10 @@ export class SessionAffinityRegistry {
         existing?.firstTextAssistantFp || anchors.firstTextAssistantFp,
       lastSyncedAssistantFp,
       lastSyncedAssistantTextFp,
+      checkpoints: updatedCheckpoints,
       lastAbortedAssistantFp: null,
       lastAbortedAssistantTextFp: null,
+      lastInterruptedUserFp: null,
       syncedTurnCount: (existing?.syncedTurnCount ?? 0) + 1,
       consecutiveAborts: 0,
       hasPendingInterruptedTurn: false,
@@ -544,24 +800,45 @@ export class SessionAffinityRegistry {
 
   /**
    * Records a timeout, client cancellation, or RPC error on a session:
-   * - Refreshes TTL so a quick retry won't expire mid-recovery;
-   * - Allows the 1st interruption (`consecutiveAborts === 1`) to reuse the warm session;
-   * - Trips the circuit breaker (`shouldDestroy: true`) ifTurn 1 never completed or if
-   *   `consecutiveAborts >= MAX_CONSECUTIVE_SESSION_ABORTS` (2).
+   * - Manual client cancellations (`isClientAbort: true`) keep the session alive and
+   *   NEVER increment `consecutiveAborts` (healthy `session/cancel`);
+   * - Timeouts / RPC errors (`isClientAbort: false`) increment `consecutiveAborts` and
+   *   trip the 2-strike circuit breaker (`shouldDestroy: true`) when `>= 2` or if Turn 1 failed.
    */
   public recordTurnInterruption(
     sessionId: string,
-    partialAssistantMsg?: OpenAIMessage
+    optionsOrPartial?: RecordInterruptionOptions | OpenAIMessage
   ): { shouldDestroy: boolean; consecutiveAborts: number } {
     const existing = this.sessions.get(sessionId);
-    if (!existing || existing.syncedTurnCount === 0) {
+    if (!existing) {
+      return { shouldDestroy: true, consecutiveAborts: 1 };
+    }
+
+    const opts: RecordInterruptionOptions =
+      optionsOrPartial && "role" in optionsOrPartial
+        ? { partialAssistantMsg: optionsOrPartial }
+        : (optionsOrPartial as RecordInterruptionOptions) || {};
+
+    const isClientAbort = Boolean(opts.isClientAbort);
+    const partialAssistantMsg = opts.partialAssistantMsg;
+    const lastUserMsg = opts.lastUserMsg;
+
+    // Only genuine errors/timeouts on an unsynced Turn 1 destroy the session;
+    // manual user cancellation on Turn 1 keeps the warm session ready for retry/continue.
+    if (!isClientAbort && existing.syncedTurnCount === 0) {
       this.sessions.delete(sessionId);
       return { shouldDestroy: true, consecutiveAborts: 1 };
     }
 
-    existing.consecutiveAborts += 1;
+    if (!isClientAbort) {
+      existing.consecutiveAborts += 1;
+    }
     existing.hasPendingInterruptedTurn = true;
     existing.updatedAt = Date.now();
+
+    if (lastUserMsg && lastUserMsg.role === "user") {
+      existing.lastInterruptedUserFp = computeUserFingerprint(lastUserMsg);
+    }
 
     if (partialAssistantMsg) {
       const hasText =

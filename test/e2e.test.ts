@@ -295,10 +295,25 @@ function testSessionAnchorAndPromptFramingUnit() {
   assert.equal(hitAfterStrip!.deltaMessages[0].content, "Talk to the innkeeper");
   assert.equal(hitAfterStrip!.isRetryAfterInterrupt, false);
 
-  // Simulate 1st timeout/abort with partial reply: session stays alive, retry hits with isRetryAfterInterrupt=true
+  // Simulate repeated manual user cancellations (`isClientAbort: true`):
+  // must NEVER increment `consecutiveAborts` or trip the 2-strike error circuit breaker!
+  for (let i = 0; i < 3; i++) {
+    const manualCancel = reg.recordTurnInterruption("s1", {
+      isClientAbort: true,
+      lastUserMsg: { role: "user", content: "Talk to the innkeeper" },
+    });
+    assert.equal(manualCancel.shouldDestroy, false);
+    assert.equal(manualCancel.consecutiveAborts, 0);
+  }
+
+  // Simulate 1st genuine timeout/RPC error (`isClientAbort: false`) with partial reply:
+  // session stays alive (`consecutiveAborts === 1`), retry hits with `isRetryAfterInterrupt=true`
   const abort1 = reg.recordTurnInterruption("s1", {
-    role: "assistant",
-    content: "The innkeeper looks up and—",
+    isClientAbort: false,
+    partialAssistantMsg: {
+      role: "assistant",
+      content: "The innkeeper looks up and—",
+    },
   });
   assert.equal(abort1.shouldDestroy, false);
   assert.equal(abort1.consecutiveAborts, 1);
@@ -323,8 +338,8 @@ function testSessionAnchorAndPromptFramingUnit() {
     "Actually, inspect the noticeboard instead"
   );
 
-  // Simulate 2nd consecutive abort -> circuit breaker destroys poisoned session!
-  const abort2 = reg.recordTurnInterruption("s1");
+  // Simulate 2nd consecutive genuine timeout/error -> circuit breaker destroys poisoned session!
+  const abort2 = reg.recordTurnInterruption("s1", { isClientAbort: false });
   assert.equal(abort2.shouldDestroy, true);
   assert.equal(abort2.consecutiveAborts, 2);
   assert.equal(
@@ -332,22 +347,108 @@ function testSessionAnchorAndPromptFramingUnit() {
     null
   );
 
-  // Verify history rewind detection (user deleted lastSyncedAssistant turn)
+  // Case B: Frontend-Cancel vs Backend-Finish Race (sliding bookmark fallback + deduplication)
+  const sampleTools: OpenAIToolDefinition[] = [
+    {
+      type: "function",
+      function: { name: "draw_svg", parameters: { type: "object" } },
+    },
+  ];
+  const raceTurn3: OpenAIMessage[] = [
+    { role: "user", content: "请画一张鹈鹕骑自行车的svg" },
+    { role: "assistant", content: "SVG 文件已保存。" },
+    { role: "user", content: "我突然想到一件事" },
+    { role: "assistant", content: "哈哈，想到什么好玩的想法或疑问了？请讲！" },
+  ];
+  reg.registerTurnState("gemini-3.8-flash", sampleTools, raceTurn3, "w1", "s_race", 51100);
+
+  // Backend finishes short reply `A4` ("请讲！") in 2.3s for accidental `"就是"`, advancing latest bookmark
+  const raceTurn4BackendCompleted: OpenAIMessage[] = [
+    ...raceTurn3,
+    { role: "user", content: "就是" },
+    { role: "assistant", content: "请继续说，我在听！" },
+  ];
   reg.registerTurnState(
-    "gemini-4-carbon",
-    undefined,
-    [
-      ...clientStrippedHistory,
-      { role: "assistant", content: "The innkeeper greets you warmly." },
-    ],
+    "gemini-3.8-flash",
+    sampleTools,
+    raceTurn4BackendCompleted,
     "w1",
-    "s2",
-    2000
+    "s_race",
+    51200
   );
-  const rewoundHistory: OpenAIMessage[] = [
+
+  // Background helper request WITHOUT `tools` must skip `s_race` WITHOUT deleting it!
+  const helperNoToolsMatch = reg.findBestMatchingPrefix(
+    "gemini-3.8-flash",
+    undefined,
+    [...raceTurn3, { role: "user", content: "Summarize title" }],
+    callbacks
+  );
+  assert.equal(helperNoToolsMatch, null);
+
+  // Frontend cancelled `"就是"`, discarded `A4`, kept `User("就是")`, and appended corrected user message:
+  const raceClientFollowup: OpenAIMessage[] = [
+    ...raceTurn3,
+    { role: "user", content: "就是" },
+    { role: "user", content: "就是，你这个左脚的前后覆盖顺序画错了" },
+  ];
+  const hitRaceFallback = reg.findBestMatchingPrefix(
+    "gemini-3.8-flash",
+    sampleTools,
+    raceClientFollowup,
+    callbacks
+  );
+  assert.ok(hitRaceFallback, "Expected sliding bookmark HIT when frontend discarded cancelled reply");
+  assert.equal(hitRaceFallback!.entry.sessionId, "s_race");
+  assert.equal(hitRaceFallback!.isRetryAfterInterrupt, true);
+  assert.equal(hitRaceFallback!.deltaMessages.length, 1);
+  assert.equal(
+    hitRaceFallback!.deltaMessages[0].content,
+    "就是，你这个左脚的前后覆盖顺序画错了"
+  );
+
+  // Case C: Turn-1 pre-registration + cancel before first assistant message -> reuse on `"请继续"`
+  const turn1Initial: OpenAIMessage[] = [
+    { role: "user", content: "请画一张鹈鹕骑自行车的svg" },
+  ];
+  reg.registerInitialSession("gemini-3.8-flash", sampleTools, turn1Initial, "w1", "s_turn1");
+  reg.recordTurnInterruption("s_turn1", {
+    isClientAbort: true,
+    lastUserMsg: turn1Initial[0],
+  });
+  const hitTurn1Continue = reg.findBestMatchingPrefix(
+    "gemini-3.8-flash",
+    sampleTools,
+    [...turn1Initial, { role: "user", content: "请继续" }],
+    callbacks
+  );
+  assert.ok(hitTurn1Continue, "Expected Turn-1 pre-registered session HIT after cancel");
+  assert.equal(hitTurn1Continue!.entry.sessionId, "s_turn1");
+  assert.equal(hitTurn1Continue!.deltaMessages.length, 1);
+  assert.equal(hitTurn1Continue!.deltaMessages[0].content, "请继续");
+
+  // Verify deep history rewind detection (user deleted 2+ completed turns)
+  const s2Turn1: OpenAIMessage[] = [
     { role: "user", content: "Start adventure" },
     { role: "assistant", content: "You rolled 18 and enter the tavern." },
-    { role: "user", content: "Rewound Turn 2 completely!" },
+  ];
+  const s2Turn2: OpenAIMessage[] = [
+    ...s2Turn1,
+    { role: "user", content: "Talk to the innkeeper" },
+    { role: "assistant", content: "The innkeeper greets you warmly." },
+  ];
+  const s2Turn3: OpenAIMessage[] = [
+    ...s2Turn2,
+    { role: "user", content: "Order an ale" },
+    { role: "assistant", content: "He slides a foamy mug across the counter." },
+  ];
+  reg.registerTurnState("gemini-4-carbon", undefined, s2Turn1, "w1", "s2", 1500);
+  reg.registerTurnState("gemini-4-carbon", undefined, s2Turn2, "w1", "s2", 2000);
+  reg.registerTurnState("gemini-4-carbon", undefined, s2Turn3, "w1", "s2", 2500);
+
+  const rewoundHistory: OpenAIMessage[] = [
+    ...s2Turn1,
+    { role: "user", content: "Rewound 2 turns back completely!" },
   ];
   const rewindMatch = reg.findBestMatchingPrefix(
     "gemini-4-carbon",
@@ -361,7 +462,7 @@ function testSessionAnchorAndPromptFramingUnit() {
   );
 
   console.log(
-    "   -> Passed! Anchor matching, tool-strip tolerance, 2-strike abort breaker, rewind guard & [USER] framing verified."
+    "   -> Passed! Anchor matching, sliding bookmarks, manual-cancel immunity, 2-strike error breaker, tool-less skip & [USER] framing verified."
   );
 }
 
@@ -734,6 +835,104 @@ async function runIntegrationTest() {
       JSON.stringify(retryTurn.content)
     );
     assert.ok(retryTurn.content.includes("OMEGA-SH-7749"));
+
+    console.log(
+      "\n9. [E2E Turn 4 — Same-Session Preemption on Lingering Proxy Stream + `: keepalive` Check]..."
+    );
+    messages.push(
+      {
+        role: "user",
+        content:
+          "Reply with ONLY the exact secret weather code for Shanghai from earlier.",
+      },
+      {
+        role: "assistant",
+        content: retryTurn.content,
+      }
+    );
+
+    // Start a long streaming turn WITHOUT aborting its HTTP client (simulates `cpa-plugin` lingering connection)
+    const resLingering = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-3.8-flash(high)",
+        messages: [
+          ...messages,
+          {
+            role: "user",
+            content:
+              "Write a comprehensive 600-word historical treatise on global meteorology.",
+          },
+        ],
+        tools,
+        stream: true,
+      }),
+    });
+    assert.equal(resLingering.status, 200);
+    assert.equal(resLingering.headers.get("X-Agy2Api-Session-Id"), sessionId1);
+    const lingeringDrainPromise = consumeSseStream(resLingering).catch(() => ({
+      content: "",
+      toolCalls: [],
+      finishReason: null,
+      lastModel: null,
+      usage: null,
+    }));
+
+    // Wait >1s so `: keepalive` comment frame fires while `resLingering` is still open & in-flight
+    await new Promise((r) => setTimeout(r, 1100));
+
+    // Fire the next message on the SAME conversation WITHOUT closing `resLingering` first!
+    const resPreempt = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-3.8-flash(low)",
+        messages: [
+          ...messages,
+          {
+            role: "user",
+            content:
+              "Write a comprehensive 600-word historical treatise on global meteorology.",
+          },
+          {
+            role: "user",
+            content:
+              "Never mind that essay — reply with ONLY the exact secret weather code for Shanghai.",
+          },
+        ],
+        tools,
+        stream: true,
+      }),
+    });
+    assert.equal(resPreempt.status, 200);
+    const preemptCache = resPreempt.headers.get("X-Agy2Api-Session-Cache");
+    const preemptSessionId = resPreempt.headers.get("X-Agy2Api-Session-Id");
+    console.log(
+      `   -> Preempted Lingering Stream Headers: Cache=${preemptCache}, SessionId=${preemptSessionId}`
+    );
+    assert.equal(preemptCache, "HIT");
+    assert.equal(preemptSessionId, sessionId1);
+
+    const [lingeringResult, preemptTurn] = await Promise.all([
+      lingeringDrainPromise,
+      consumeSseStream(resPreempt),
+    ]);
+    assert.ok(
+      !lingeringResult.content.includes("[Gateway Error:"),
+      "Preempted stream must close cleanly without injecting fake gateway error text"
+    );
+    console.log(
+      "   -> Preempted Turn Content:",
+      JSON.stringify(preemptTurn.content)
+    );
+    assert.ok(preemptTurn.content.includes("OMEGA-SH-7749"));
 
     console.log("\nALL UNIT & E2E TESTS PASSED SUCCESSFULLY!");
   } finally {

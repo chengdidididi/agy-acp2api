@@ -11,6 +11,7 @@ import {
   compileFullPrompt,
 } from "../compiler/prompt-compiler.js";
 import { ToolCallStreamParser } from "../parser/stream-parser.js";
+import { PromptInterruptedError } from "../pool/acp-worker.js";
 import { WorkerPool } from "../pool/worker-pool.js";
 import { telemetryStore } from "../telemetry/metrics-store.js";
 import {
@@ -294,6 +295,13 @@ export function createGatewayApp(pool: WorkerPool): Hono {
           acpModelId,
           thinkingLevel
         );
+        pool.sessionRegistry.registerInitialSession(
+          baseModelId,
+          body.tools,
+          body.messages,
+          lease.worker.id,
+          sessionId
+        );
         promptText = compiled.promptText;
       }
     } catch (err: any) {
@@ -321,6 +329,9 @@ export function createGatewayApp(pool: WorkerPool): Hono {
     const externalToolNames = new Set(
       (body.tools || []).map((t) => t.function.name)
     );
+    const lastUserMsg = [...body.messages]
+      .reverse()
+      .find((m) => m.role === "user");
 
     const buildOpenAIUsage = (
       acpUsage?: {
@@ -402,6 +413,18 @@ export function createGatewayApp(pool: WorkerPool): Hono {
         };
 
         sendChunk(makeChunk({ role: "assistant" }));
+
+        // Periodic SSE comment frame (`: keepalive\n\n`) every 1s:
+        // Ignored by OpenAI/SSE clients, but wakes up intermediate streaming proxies
+        // (such as `cpa-plugin`'s `body.Read` + `MethodHostStreamEmit`) and Hono's `pull()`
+        // so downstream user cancellations propagate to `session/cancel` within <= 1s
+        // even during silent thinking periods.
+        const keepaliveTimer = setInterval(() => {
+          if (!abortController.signal.aborted) {
+            stream.write(": keepalive\n\n").catch(() => {});
+          }
+        }, 1000);
+        keepaliveTimer.unref?.();
 
         try {
           const promptRes = await lease.worker.runPrompt(
@@ -501,7 +524,8 @@ export function createGatewayApp(pool: WorkerPool): Hono {
             sessionId,
             lease.isReusedSession,
             err,
-            partialMsg
+            partialMsg,
+            lastUserMsg
           );
 
           telemetryStore.recordCompletedRequest({
@@ -530,7 +554,9 @@ export function createGatewayApp(pool: WorkerPool): Hono {
             errorMessage: err?.message || String(err),
           });
 
-          if (!abortController.signal.aborted) {
+          const isClientCancel =
+            err instanceof PromptInterruptedError && err.isClientAbort;
+          if (!abortController.signal.aborted && !isClientCancel) {
             try {
               sendChunk(
                 makeChunk(
@@ -544,6 +570,7 @@ export function createGatewayApp(pool: WorkerPool): Hono {
             } catch {}
           }
         } finally {
+          clearInterval(keepaliveTimer);
           c.req.raw.signal.removeEventListener("abort", triggerAbort);
           pool.releaseWorker(lease.worker);
         }
@@ -654,7 +681,8 @@ export function createGatewayApp(pool: WorkerPool): Hono {
         sessionId,
         lease.isReusedSession,
         err,
-        partialMsg
+        partialMsg,
+        lastUserMsg
       );
 
       telemetryStore.recordCompletedRequest({

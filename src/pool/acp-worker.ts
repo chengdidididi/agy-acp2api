@@ -82,6 +82,8 @@ export class AcpWorker {
   private activeStreamListeners = new Map<string, PromptStreamCallbacks>();
   private activeSessions = new Set<string>();
   private cancellingSessions = new Set<string>();
+  private currentPromptSessionId: string | null = null;
+  private currentPromptAbortFn: (() => void) | null = null;
   private idleWaiters: Array<() => void> = [];
   private cancelListeners = new Map<string, Array<() => void>>();
   private sessionAssignedModel = new Map<string, string>();
@@ -178,6 +180,26 @@ export class AcpWorker {
 
   public isCancellingSession(sessionId: string): boolean {
     return this.cancellingSessions.has(sessionId);
+  }
+
+  public getCurrentPromptSessionId(): string | null {
+    return this.currentPromptSessionId;
+  }
+
+  /**
+   * Actively cancels an in-flight `runPrompt` on `sessionId` when a newer request for
+   * the exact same conversation arrives before a downstream proxy/client closed the old HTTP socket.
+   */
+  public preemptSession(sessionId: string): boolean {
+    if (
+      this.state !== "BUSY" ||
+      this.currentPromptSessionId !== sessionId ||
+      !this.currentPromptAbortFn
+    ) {
+      return false;
+    }
+    this.currentPromptAbortFn();
+    return true;
   }
 
   public hasIdleWaiters(): boolean {
@@ -350,10 +372,15 @@ export class AcpWorker {
       });
     }
 
+    this.currentPromptSessionId = sessionId;
+    let preemptedBeforePrompt = false;
+
     const onPrePromptAbort = () => {
+      preemptedBeforePrompt = true;
       this.cancellingSessions.add(sessionId);
       this.notifySessionCancelling(sessionId);
     };
+    this.currentPromptAbortFn = onPrePromptAbort;
     if (abortSignal) {
       abortSignal.addEventListener("abort", onPrePromptAbort, { once: true });
     }
@@ -365,7 +392,9 @@ export class AcpWorker {
       }
     }
 
-    if (abortSignal?.aborted) {
+    if (abortSignal?.aborted || preemptedBeforePrompt) {
+      this.currentPromptSessionId = null;
+      this.currentPromptAbortFn = null;
       this.cancellingSessions.delete(sessionId);
       throw new PromptInterruptedError("Request aborted before prompt started", {
         isTimeout: false,
@@ -376,6 +405,8 @@ export class AcpWorker {
     }
 
     if (this.state === "DEAD" || !this.proc?.stdin.writable) {
+      this.currentPromptSessionId = null;
+      this.currentPromptAbortFn = null;
       throw new PromptInterruptedError(`Worker ${this.id} is not writable`, {
         isTimeout: false,
         isClientAbort: false,
@@ -469,6 +500,7 @@ export class AcpWorker {
         const onAbort = () => {
           markCancelStart("abort");
         };
+        this.currentPromptAbortFn = onAbort;
 
         if (abortSignal && !abortSignal.aborted) {
           abortSignal.addEventListener("abort", onAbort, { once: true });
@@ -560,6 +592,8 @@ export class AcpWorker {
         actualModelVersion,
       };
     } finally {
+      this.currentPromptSessionId = null;
+      this.currentPromptAbortFn = null;
       this.activeStreamListeners.delete(sessionId);
       this.lastUsedAt = Date.now();
     }
@@ -604,6 +638,8 @@ export class AcpWorker {
       pending.reject(new Error(`Worker ${this.id} destroyed`));
     }
     this.pendingRpcs.clear();
+    this.currentPromptSessionId = null;
+    this.currentPromptAbortFn = null;
     this.activeStreamListeners.clear();
     this.activeSessions.clear();
     this.cancellingSessions.clear();
@@ -802,6 +838,8 @@ export class AcpWorker {
       pending.reject(err);
     }
     this.pendingRpcs.clear();
+    this.currentPromptSessionId = null;
+    this.currentPromptAbortFn = null;
     this.activeStreamListeners.clear();
     this.activeSessions.clear();
     this.cancellingSessions.clear();
