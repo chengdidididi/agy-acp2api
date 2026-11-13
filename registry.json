@@ -27,36 +27,36 @@
             "goos": "darwin",
             "goarch": "amd64",
             "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.0_darwin_amd64.zip",
-            "sha256": "aef2693de0db14a024d68f07c31595aa1d926482428055ca1e88c2124e38eba2",
-            "size": 2657843
+            "sha256": "4f41308e6db63bcefb6728e354f6a95f9eff202d0d5d369ae3f6a0c18eefdfbd",
+            "size": 2657840
           },
           {
             "goos": "darwin",
             "goarch": "arm64",
             "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.0_darwin_arm64.zip",
-            "sha256": "8bc2adaff3f6f3a4c44dab2ac52ef1ab46b7b9d2efd5f5fc01c00b28f619e659",
-            "size": 2494503
+            "sha256": "647b14216f2905d3a1aecb0c5ae589852b32042536685d469db71345c48a247b",
+            "size": 2494506
           },
           {
             "goos": "linux",
             "goarch": "amd64",
             "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.0_linux_amd64.zip",
-            "sha256": "63fa9192e63e5681786adf88cac8464fed5fb309dcd08d1a2bd28763e992e275",
-            "size": 2790393
+            "sha256": "f424e3c920d8a66358fb331dc4df9bbee4d22dfae8eeaf11c4e0408bfbb94693",
+            "size": 2790395
           },
           {
             "goos": "linux",
             "goarch": "arm64",
             "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.0_linux_arm64.zip",
-            "sha256": "4007f4908d5afd7bd97dad0a2d4b5a69f7eec756ad9b3774cab0c0ae857db488",
-            "size": 2577272
+            "sha256": "046073662614e6e194ef57fa4ea34fc71b8903b50c42a54052e23edbdadc8a01",
+            "size": 2577271
           },
           {
             "goos": "windows",
             "goarch": "amd64",
             "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.0_windows_amd64.zip",
-            "sha256": "d0d95a6bd63ced462ec014730991c4bfff9bfe95ddd902d7eb02d91ac13a0e14",
-            "size": 2719212
+            "sha256": "71652ba192f97bb6c4bc20fd28b279a45b51082e282b7f2d54deb4aeedfecf93",
+            "size": 2719213
           }
         ]
       }
