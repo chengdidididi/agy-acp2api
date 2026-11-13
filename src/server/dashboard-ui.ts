@@ -250,7 +250,8 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   .section-h { display:flex; align-items:center; flex-wrap:wrap; gap:12px; margin-top:8px; font-size:16px; font-weight:500; }
 
   /* ---------- Workers ---------- */
-  .worker { display:flex; flex-direction:column; gap:16px; }
+  .worker { display:flex; flex-direction:column; gap:16px; cursor:pointer; transition:background .15s var(--ease), box-shadow .15s var(--ease); }
+  .worker:hover { background:var(--sc-high); box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--primary) 35%, transparent); }
   .w-head { display:flex; align-items:center; gap:12px; }
   .w-id { display:flex; flex-direction:column; gap:4px; flex:1; min-width:0; }
   .w-id .mono { font-size:15px; }
@@ -296,7 +297,8 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   .scrim { position:fixed; inset:0; background:rgba(0,0,0,.32); opacity:0; pointer-events:none; transition:opacity .2s; z-index:30; }
   .scrim.on { opacity:1; pointer-events:auto; }
   .sheet { position:fixed; top:0; right:0; bottom:0; width:min(440px, 100vw); background:var(--sc-low); border-radius:16px 0 0 16px;
-           transform:translateX(105%); transition:transform .3s var(--ease); z-index:31; display:flex; flex-direction:column; }
+           transform:translateX(105%); transition:transform .3s var(--ease), width .25s var(--ease); z-index:31; display:flex; flex-direction:column; }
+  .sheet.wide { width:min(680px, 100vw); }
   .sheet.on { transform:none; }
   .sheet-head { display:flex; align-items:center; gap:8px; padding:12px 12px 8px 24px; font-size:22px; }
   .sheet-body { overflow:auto; padding:4px 24px 32px; display:flex; flex-direction:column; gap:24px; }
@@ -320,6 +322,37 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   .mini-list { display:flex; flex-direction:column; }
   .mini-row { display:grid; grid-template-columns:64px 24px 1fr 56px 56px; align-items:center; gap:8px; padding:8px; border-radius:8px; cursor:pointer; }
   .mini-row:hover { background:color-mix(in srgb, var(--on-surface) 6%, transparent); }
+  .log-sum { display:block; max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .code-box { margin:0; padding:12px 14px; border-radius:12px; background:var(--sc-lowest); border:1px solid var(--outline-variant); font-family:var(--mono);
+              font-size:12px; line-height:1.55; white-space:pre-wrap; word-break:break-word; max-height:360px; overflow:auto; color:var(--on-surface); }
+  .raw-fold { border-radius:12px; background:var(--sc); border:1px solid var(--outline-variant); overflow:hidden; }
+  .raw-fold summary { display:flex; align-items:center; gap:8px; padding:10px 14px; cursor:pointer; font-size:13px; font-weight:500;
+                      color:var(--on-surface-variant); user-select:none; list-style:none; }
+  .raw-fold summary::-webkit-details-marker { display:none; }
+  .raw-fold summary .ms { font-size:18px; transition:transform .15s var(--ease); }
+  .raw-fold[open] summary .ms { transform:rotate(90deg); }
+  .raw-fold .raw-list { border-top:1px solid var(--outline-variant); padding:10px 14px; display:flex; flex-direction:column; gap:6px;
+                        max-height:280px; overflow:auto; background:var(--sc-lowest); }
+  .raw-line { font-family:var(--mono); font-size:11.5px; line-height:1.45; word-break:break-all; color:var(--on-surface-variant); }
+  .dbg-row { display:grid; grid-template-columns:84px 78px 1fr 38px; align-items:center; gap:8px; padding:8px; border-radius:8px; cursor:pointer; }
+  .dbg-row:hover { background:color-mix(in srgb, var(--on-surface) 6%, transparent); }
+  .live-bar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .seg.sm { height:32px; border-radius:16px; }
+  .seg.sm button { padding:0 12px; font-size:12px; gap:4px; }
+  .live-log { flex:1; min-height:280px; max-height:calc(100vh - 250px); overflow:auto; padding:10px 12px; border-radius:12px;
+              background:var(--sc-lowest); border:1px solid var(--outline-variant); font-family:var(--mono); font-size:12px; line-height:1.5; }
+  .w-ln { display:flex; align-items:flex-start; gap:8px; padding:3px 0; border-bottom:1px solid color-mix(in srgb, var(--outline-variant) 22%, transparent); }
+  .w-ln:last-child { border-bottom:0; }
+  .w-ts { color:var(--on-surface-variant); flex:none; font-size:11px; opacity:.85; }
+  .w-tag { flex:none; font-size:10.5px; font-weight:600; padding:0 5px; border-radius:4px; line-height:18px; text-transform:uppercase; }
+  .w-tag.stdout { background:var(--primary-container); color:var(--on-primary-container); }
+  .w-tag.stderr { background:var(--error-container); color:var(--on-error-container); }
+  .w-tag.stdin { background:var(--secondary-container); color:var(--on-secondary-container); }
+  .w-tag.sys { background:var(--sc-highest); color:var(--on-surface-variant); }
+  .w-sid { color:var(--primary); flex:none; font-size:11px; }
+  .w-txt { flex:1; min-width:0; white-space:pre-wrap; word-break:break-all; color:var(--on-surface); }
+  .w-ln.stderr .w-txt { color:var(--error); }
+  .w-ln.sys .w-txt { color:var(--on-surface-variant); }
 
   dialog { border:0; padding:24px; border-radius:28px; background:var(--sc-high); color:var(--on-surface); width:min(340px, calc(100vw - 48px)); }
   dialog::backdrop { background:rgba(0,0,0,.4); }
@@ -354,6 +387,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   @media (max-width: 640px) {
     .app { flex-direction:column; }
     html:not([data-layout="top"]) .drawer { position:fixed; top:auto; bottom:0; left:0; right:0; width:100%; height:80px; flex-direction:row; justify-content:space-around; z-index:20; padding:0; }
+    html:not([data-layout="top"]) .nav-item { flex:1; width:auto; max-width:80px; }
     html:not([data-layout="top"]) .brand { display:none; }
     html:not([data-layout="top"]) .content { padding:0 16px 104px; }
     .kpis { grid-template-columns:1fr; }
@@ -392,6 +426,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     <a class="nav-item" href="#home" data-page="home"><span class="nav-ic"><span class="ms">space_dashboard</span></span><span>首页</span></a>
     <a class="nav-item" href="#traffic" data-page="traffic"><span class="nav-ic"><span class="ms">monitoring</span></span><span>请求</span></a>
     <a class="nav-item" href="#runtime" data-page="runtime"><span class="nav-ic"><span class="ms">memory</span><span class="badge" id="badge-rt"></span></span><span>运行</span></a>
+    <a class="nav-item" href="#debug" data-page="debug"><span class="nav-ic"><span class="ms">bug_report</span><span class="badge err" id="badge-dbg"></span></span><span>调试</span></a>
     <a class="nav-item" href="#settings" data-page="settings"><span class="nav-ic"><span class="ms">tune</span></span><span>设置</span></a>
     <div class="top-actions">
       <span class="chip t-plain" id="sync-top" data-tip="连接中"><span class="dot" id="sync-dot-top"></span><span id="sync-t-top">…</span></span>
@@ -465,6 +500,21 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       <div class="card flush"><div class="tbl-wrap" id="rt-sessions"></div></div>
     </section>
 
+    <!-- 调试 -->
+    <section class="page" id="page-debug">
+      <div class="toolbar">
+        <div class="seg" id="debug-tabs">
+          <button data-act="dtab" data-tab="sess" class="on"><span class="ms">forum</span>会话</button>
+          <button data-act="dtab" data-tab="log"><span class="ms">terminal</span>日志</button>
+        </div>
+        <span id="debug-sess-chip"></span>
+        <span class="grow"></span>
+        <button class="btn outlined" data-act="clear-dlogs"><span class="ms">delete_sweep</span>清空日志</button>
+        <label class="search"><span class="ms">search</span><input id="dq" placeholder="筛选会话 / 方法 / 内容" autocomplete="off" /></label>
+      </div>
+      <div class="card flush"><div class="tbl-wrap" id="debug-body"></div></div>
+    </section>
+
     <!-- 设置 -->
     <section class="page" id="page-settings">
       <div class="grid settings" id="settings-form">
@@ -533,6 +583,17 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
         </div>
 
         <div class="card">
+          <div class="card-h"><span class="ic sm t-warn"><span class="ms">bug_report</span></span><span>调试日志</span></div>
+          <div class="field"><label>日志存续时间</label>
+            <div class="field-box"><input id="f-logRet" type="number" min="0" step="1" /><span class="suffix">分钟</span></div>
+          </div>
+          <div class="ttl-hint">
+            <span class="ms">info</span>
+            <span>会话销毁后调试日志继续保留的时长；设为 0 则在会话关闭时立即清理（默认 60 分钟）。</span>
+          </div>
+        </div>
+
+        <div class="card">
           <div class="card-h"><span class="ic sm t-secondary"><span class="ms">dashboard_customize</span></span><span>界面适配</span></div>
           <div class="field-l"><label>导航栏位置（CPA 插件面板推荐顶部）</label>
             <div class="seg full" id="f-layout">
@@ -566,8 +627,13 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
 <div class="tip" id="tip"></div>
 
 <script>
-  var S = { d: null, page: "home", tab: "req", q: "", sheet: null, cfgReady: false, dirty: false, level: "medium", layout: localStorage.getItem("agy-layout") || "side", last: 0 };
-  var TITLES = { home: "首页", traffic: "请求", runtime: "运行", settings: "设置" };
+  var S = {
+    d: null, page: "home", tab: "req", q: "", sheet: null, cfgReady: false, dirty: false, level: "medium",
+    layout: localStorage.getItem("agy-layout") || "side", last: 0,
+    dtab: "sess", dq: "", dsess: "", dsessions: [], dlogs: [], dlogDetail: null, dlogDetailId: 0, dsessLogs: [],
+    wLogs: [], wLastSeq: 0, wFilter: "all", wPaused: false, wStickBottom: true, wAlive: true, wState: "", wPolling: false
+  };
+  var TITLES = { home: "首页", traffic: "请求", runtime: "运行", debug: "调试", settings: "设置" };
   var LV = { low: 1, medium: 2, high: 3, xhigh: 4 };
   function $(id) { return document.getElementById(id); }
 
@@ -635,6 +701,10 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   function clock(ts) {
     var d = new Date(ts);
     return [d.getHours(), d.getMinutes(), d.getSeconds()].map(function (x) { return String(x).padStart(2, "0"); }).join(":");
+  }
+  function clockMs(ts) {
+    var d = new Date(ts);
+    return clock(ts) + "." + String(d.getMilliseconds()).padStart(3, "0");
   }
   function dateTime(ts) { var d = new Date(ts); return (d.getMonth() + 1) + "/" + d.getDate() + " " + clock(ts); }
   function pct(v) { return trimZ((Number(v) || 0).toFixed(1)) + "%"; }
@@ -894,10 +964,11 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
               '<button class="chip-x" data-act="close-sess" data-w="' + esc(w.id) + '" data-s="' + esc(id) + '"><span class="ms">close</span></button></span>';
           }).join("")
         : '<span class="muted">–</span>';
-      return '<div class="card worker">' +
+      return '<div class="card worker" data-act="open-worker" data-id="' + esc(w.id) + '">' +
         '<div class="w-head"><span class="ic ' + (tn === "busy" ? "t-primary" : tn === "ok" ? "t-ok" : tn === "warn" ? "t-warn" : "t-err") + '"><span class="ms">memory</span></span>' +
         '<div class="w-id"><span class="mono strong" data-tip="' + esc(w.relAppDataDir) + '">' + esc(w.id) + "</span>" +
         '<span class="muted" style="display:flex;align-items:center;gap:6px;font-size:12px"><span class="dot ' + tn + (tn === "busy" ? " pulse" : "") + '"></span>' + stateName(w.state) + "</span></div>" +
+        '<button class="icon-btn" data-act="open-worker" data-id="' + esc(w.id) + '" data-tip="即时日志"><span class="ms">terminal</span></button>' +
         '<button class="icon-btn danger" data-act="kill" data-id="' + esc(w.id) + '" data-tip="销毁"><span class="ms">power_settings_new</span></button></div>' +
         '<div class="w-stats">' +
         '<div class="stat" data-tip="PID"><span class="ms">tag</span><span class="mono">' + (w.pid || "–") + "</span></div>" +
@@ -924,6 +995,130 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
           '<td class="mono">' + s.turns + "</td>" +
           '<td class="r"><button class="icon-btn" data-act="close-sess" data-w="' + esc(s.workerId) + '" data-s="' + esc(s.sessionId) + '" data-tip="关闭"><span class="ms">close</span></button></td></tr>';
       }).join("") + "</tbody></table>";
+  }
+
+  /* ---------- debug ---------- */
+  function catMeta(cat) {
+    var M = {
+      rpc_req: ["RPC 请求", "t-secondary"],
+      rpc_res: ["RPC 响应", "t-plain"],
+      rpc_srv: ["权限请求", "t-warn"],
+      thought: ["思考流", "t-tertiary"],
+      message: ["输出流", "t-primary"],
+      tool_call: ["工具事件", "t-warn"],
+      config: ["配置更新", "t-ok"],
+      stderr: ["STDERR", "t-err"],
+      stdout_raw: ["原始输出", "t-plain"],
+      error: ["错误", "t-err"],
+      sys: ["系统", "t-plain"]
+    };
+    return M[cat] || [cat || "日志", "t-plain"];
+  }
+  function catChip(cat) {
+    var m = catMeta(cat);
+    return '<span class="chip ' + m[1] + '">' + esc(m[0]) + "</span>";
+  }
+  function debugApi(kind, params) {
+    var isCpaResource = location.pathname.indexOf("/v0/resource/plugins/") === 0;
+    var qs = [];
+    if (params) {
+      Object.keys(params).forEach(function (k) {
+        if (params[k] !== undefined && params[k] !== null && params[k] !== "") {
+          qs.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(params[k])));
+        }
+      });
+    }
+    if (isCpaResource) {
+      var cpaUrl = "./api/admin/overview?_debug=" + encodeURIComponent(kind);
+      if (qs.length) cpaUrl += "&" + qs.join("&");
+      return api("GET", cpaUrl);
+    }
+    if (kind === "sessions") return api("GET", "./api/admin/debug/sessions" + (qs.length ? "?" + qs.join("&") : ""));
+    if (kind === "logs") return api("GET", "./api/admin/debug/logs" + (qs.length ? "?" + qs.join("&") : ""));
+    if (kind === "log_detail") return api("GET", "./api/admin/debug/logs/" + encodeURIComponent(String(params.id)));
+    if (kind === "worker_logs") return api("GET", "./api/admin/debug/worker-logs" + (qs.length ? "?" + qs.join("&") : ""));
+    if (kind === "clear_logs") return api("DELETE", "./api/admin/debug/logs" + (qs.length ? "?" + qs.join("&") : ""));
+    if (kind === "clear_worker_logs") return api("DELETE", "./api/admin/debug/worker-logs" + (qs.length ? "?" + qs.join("&") : ""));
+    return Promise.reject(new Error("Unknown debug endpoint"));
+  }
+  async function fetchDebugData() {
+    try {
+      if (S.page === "debug") {
+        if (S.dtab === "sess") {
+          var sr = await debugApi("sessions", { limit: 150 });
+          S.dsessions = sr.sessions || [];
+        } else {
+          var lr = await debugApi("logs", { sessionId: S.dsess || "", q: S.dq || "", limit: 200 });
+          S.dlogs = lr.logs || [];
+        }
+        if (S.d) renderDebug(S.d);
+      }
+      if (S.sheet && S.sheet.t === "dsess") {
+        var slr = await debugApi("logs", { sessionId: S.sheet.id, limit: 200 });
+        S.dsessLogs = slr.logs || [];
+        renderSheet();
+      }
+    } catch (e) {}
+  }
+  function renderDebug(d) {
+    var q = S.dq.trim().toLowerCase(), now = Date.now();
+    document.querySelectorAll("#debug-tabs button").forEach(function (b) { b.classList.toggle("on", b.getAttribute("data-tab") === S.dtab); });
+    $("debug-sess-chip").innerHTML = S.dsess
+      ? '<span class="chip lg t-secondary"><span class="ms">filter_alt</span><span class="mono">' + esc(S.dsess.slice(0, 8)) + '</span><button class="chip-x" data-act="clear-dsess-filter"><span class="ms">close</span></button></span>'
+      : "";
+
+    if (S.dtab === "sess") {
+      var ss = (S.dsessions || []).filter(function (s) {
+        return match(q, [s.sessionId, s.workerId, s.baseModelId, s.lastActualModelVersion, s.status]);
+      });
+      if (!ss.length) { $("debug-body").innerHTML = empty("forum", "暂无调试会话"); return; }
+      var ret = Number(d && d.config && d.config.logRetentionMs != null ? d.config.logRetentionMs : 3600000);
+      $("debug-body").innerHTML =
+        '<table class="tbl"><thead><tr><th>会话</th><th>进程</th><th>模型</th><th>日志</th><th>原始帧</th><th>存续 / 留存</th><th class="r">最后输出</th><th></th></tr></thead><tbody>' +
+        ss.map(function (s) {
+          var act = s.status === "ACTIVE";
+          var retCell = "";
+          if (act) {
+            retCell = '<span class="chip t-ok"><span class="dot ok pulse"></span>活跃中</span>';
+          } else if (ret <= 0) {
+            retCell = '<span class="chip t-plain">待清理</span>';
+          } else {
+            var rem = Math.max(0, ret - (now - (s.closedAt || s.lastLogAt)));
+            var pctRem = Math.max(0, Math.min(100, (rem / ret) * 100));
+            retCell = '<div style="display:flex;align-items:center;gap:8px;width:140px"><div class="lin' + (pctRem > 25 ? " ok" : "") + '" style="flex:1"><i style="width:' + pctRem + '%"></i></div><span class="mono muted">' + span(rem) + "</span></div>";
+          }
+          var modelHtml = s.baseModelId
+            ? '<span class="model">' + esc(s.baseModelId) + lv(s.lastThinkingLevel) + "</span>"
+            : '<span class="muted">–</span>';
+          return '<tr data-act="open-dsess" data-id="' + esc(s.sessionId) + '">' +
+            '<td><span class="sid"><span class="dot ' + (act ? "ok pulse" : "") + '" data-tip="' + (act ? "活跃" : "已关闭") + '"></span><span class="mono">' + esc(s.sessionId.slice(0, 8)) + "</span></span></td>" +
+            '<td><span class="chip t-plain" data-act="open-worker" data-id="' + esc(s.workerId) + '" data-tip="查看进程即时输出" style="cursor:pointer"><span class="ms">memory</span><span class="mono">' + esc(s.workerId) + "</span></span></td>" +
+            "<td>" + modelHtml + "</td>" +
+            '<td><span class="mono">' + num(s.logCount) + "</span>" + (s.errorCount > 0 ? ' <span class="chip t-err" data-tip="错误/STDERR">' + s.errorCount + "</span>" : "") + "</td>" +
+            '<td class="mono muted">' + num(s.rawLineCount) + "</td>" +
+            "<td>" + retCell + "</td>" +
+            '<td class="r mono muted" data-tip="' + dateTime(s.lastLogAt) + '">' + span(now - s.lastLogAt) + "</td>" +
+            '<td class="r"><button class="icon-btn" data-act="filter-dsess" data-id="' + esc(s.sessionId) + '" data-tip="查看日志"><span class="ms">terminal</span></button></td></tr>';
+        }).join("") + "</tbody></table>";
+    } else {
+      var ls = (S.dlogs || []).filter(function (l) {
+        if (S.dsess && l.sessionId !== S.dsess) return false;
+        return match(q, [l.sessionId, l.workerId, l.category, l.method, l.summary]);
+      });
+      if (!ls.length) { $("debug-body").innerHTML = empty("terminal", "暂无 CLI 日志"); return; }
+      $("debug-body").innerHTML =
+        '<table class="tbl"><thead><tr><th>时间</th><th>会话</th><th>进程</th><th>类型</th><th>方法</th><th>摘要</th><th class="r">帧数</th></tr></thead><tbody>' +
+        ls.map(function (l) {
+          return '<tr data-act="open-dlog" data-id="' + esc(l.id) + '">' +
+            '<td class="mono muted" data-tip="' + dateTime(l.timestamp) + '">' + clockMs(l.timestamp) + "</td>" +
+            '<td><span class="chip t-plain" data-act="open-dsess" data-id="' + esc(l.sessionId) + '" style="cursor:pointer"><span class="mono">' + esc(l.sessionId.slice(0, 8)) + "</span></span></td>" +
+            '<td><span class="chip t-plain" data-act="open-worker" data-id="' + esc(l.workerId) + '" style="cursor:pointer"><span class="mono">' + esc(l.workerId) + "</span></span></td>" +
+            "<td>" + catChip(l.category) + "</td>" +
+            '<td class="mono muted">' + esc(l.method) + "</td>" +
+            '<td><span class="log-sum mono">' + esc(l.summary) + "</span></td>" +
+            '<td class="r mono muted">' + (l.chunkCount > 1 ? "×" + l.chunkCount : "1") + "</td></tr>";
+        }).join("") + "</tbody></table>";
+    }
   }
 
   /* ---------- settings ---------- */
@@ -976,6 +1171,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     $("f-idle").value = Math.round(c.workerIdleTtlMs / 1000);
     $("f-sess").value = trimZ((c.sessionTtlMs / 60000).toFixed(1));
     $("f-timeout").value = Math.round((c.requestTimeoutMs || 300000) / 1000);
+    $("f-logRet").value = trimZ(((c.logRetentionMs != null ? c.logRetentionMs : 3600000) / 60000).toFixed(1));
     updateTtlHint();
     S.cfgReady = true;
   }
@@ -1008,6 +1204,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       maxWorkers: Number($("f-max").value),
       workerIdleTtlMs: Math.round(Number($("f-idle").value) * 1000),
       sessionTtlMs: Math.round(Number($("f-sess").value) * 60000),
+      logRetentionMs: Math.max(0, Math.round((Number($("f-logRet").value) || 0) * 60000)),
       requestTimeoutMs: Math.round(Number($("f-timeout").value) * 1000),
       uiLayout: S.layout,
     };
@@ -1077,12 +1274,165 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
         }).join("") + "</div>" : empty("receipt_long", "无记录")) +
       (act ? '<div><button class="btn outlined danger" data-act="close-sess" data-w="' + esc(s.workerId) + '" data-s="' + esc(s.sessionId) + '"><span class="ms">close</span>关闭会话</button></div>' : "");
   }
+  function dsessSheet(s, d) {
+    var act = s.status === "ACTIVE";
+    var logs = S.dsessLogs || [];
+    var ret = Number(d && d.config && d.config.logRetentionMs != null ? d.config.logRetentionMs : 3600000);
+    var retTxt = act ? "活跃中" : (ret <= 0 ? "待清理" : span(Math.max(0, ret - (Date.now() - (s.closedAt || s.lastLogAt)))));
+    return '<div class="hero"><div style="display:flex;align-items:center;gap:8px"><span class="dot ' + (act ? "ok pulse" : "") + '"></span>' +
+      '<span class="mono" style="word-break:break-all">' + esc(s.sessionId) + "</span>" +
+      '<button class="icon-btn" data-act="copy" data-copy="' + esc(s.sessionId) + '" data-tip="复制"><span class="ms">content_copy</span></button></div>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap"><span class="chip ' + (act ? "t-ok" : "t-plain") + '">' + (act ? "活跃" : "已关闭") + "</span>" +
+      '<span class="chip t-plain" data-act="open-worker" data-id="' + esc(s.workerId) + '" style="cursor:pointer"><span class="ms">memory</span><span class="mono">' + esc(s.workerId) + "</span></span>" +
+      (s.lastActualModelVersion ? upChip(s.lastActualModelVersion) : "") + "</div></div>" +
+      '<div class="mini-stats">' +
+      '<div class="stat"><span class="ms">terminal</span><span class="big">' + num(s.logCount) + '</span><span class="muted" style="font-size:12px">原始帧 ' + num(s.rawLineCount) + "</span></div>" +
+      '<div class="stat"><span class="ms">' + (s.errorCount > 0 ? "error" : "timer") + '</span><span class="big ' + (s.errorCount > 0 ? "c-err" : "") + '">' + (s.errorCount > 0 ? num(s.errorCount) : retTxt) + '</span><span class="muted" style="font-size:12px">' + (s.errorCount > 0 ? "错误 · 留存 " + retTxt : "留存剩余") + "</span></div></div>" +
+      sec("info", "摘要",
+        kv("创建时间", '<span class="mono">' + dateTime(s.createdAt) + "</span>") +
+        kv("最后输出", '<span class="mono">' + dateTime(s.lastLogAt) + "</span>") +
+        (s.closedAt ? kv("销毁时间", '<span class="mono">' + dateTime(s.closedAt) + "</span>") : "")) +
+      sec("list_alt", "CLI 输出记录 · " + logs.length,
+        logs.length ? '<div class="mini-list">' + logs.map(function (l) {
+          return '<div class="dbg-row" data-act="open-dlog" data-id="' + esc(l.id) + '">' +
+            '<span class="mono muted">' + clockMs(l.timestamp) + "</span>" +
+            catChip(l.category) +
+            '<span class="log-sum mono">' + esc(l.summary || l.method) + "</span>" +
+            '<span class="mono r muted">' + (l.chunkCount > 1 ? "×" + l.chunkCount : "1") + "</span></div>";
+        }).join("") + "</div>" : empty("terminal", "暂无日志")) +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+      '<button class="btn tonal" data-act="filter-dsess" data-id="' + esc(s.sessionId) + '"><span class="ms">filter_alt</span>在日志页筛选</button>' +
+      '<button class="btn outlined danger" data-act="clear-dsess-logs" data-id="' + esc(s.sessionId) + '"><span class="ms">delete</span>清空此会话日志</button></div>';
+  }
+  function dlogSheet(l) {
+    var frames = l.rawFrames || [];
+    return '<div class="hero"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+      catChip(l.category) +
+      '<span class="chip t-plain"><span class="mono">' + esc(l.direction.toUpperCase()) + "</span></span>" +
+      '<span class="chip t-plain"><span class="mono">#' + esc(l.id) + (l.chunkCount > 1 ? " · ×" + l.chunkCount : "") + "</span></span></div>" +
+      '<span class="mono muted">' + dateTime(l.timestamp) + " (" + clockMs(l.timestamp) + ")</span></div>" +
+      sec("info", "元数据",
+        kv("会话", '<span class="chip t-plain" data-act="open-dsess" data-id="' + esc(l.sessionId) + '" style="cursor:pointer"><span class="mono">' + esc(l.sessionId) + "</span></span>") +
+        kv("进程", '<span class="chip t-plain" data-act="open-worker" data-id="' + esc(l.workerId) + '" style="cursor:pointer"><span class="ms">memory</span><span class="mono">' + esc(l.workerId) + "</span></span>") +
+        kv("方法", '<span class="mono">' + esc(l.method) + "</span>") +
+        kv("合并帧数", '<span class="mono">' + num(l.chunkCount) + (l.rawTruncated ? " (已截断)" : "") + "</span>")) +
+      sec("article", "内容",
+        '<div style="display:flex;justify-content:flex-end;margin-bottom:8px"><button class="btn text" data-act="copy-dlog"><span class="ms">content_copy</span>复制内容</button></div>' +
+        '<pre class="code-box">' + esc(l.content || "") + "</pre>") +
+      sec("data_object", "原始 JSON-RPC 帧 · " + frames.length,
+        '<details class="raw-fold"><summary><span class="ms">chevron_right</span>展开查看原始帧' + (l.rawTruncated ? "（已达上限截断）" : "") + '</summary><div class="raw-list">' +
+        (frames.length ? frames.map(function (f) { return '<div class="raw-line">' + esc(f) + "</div>"; }).join("") : '<span class="muted">无原始帧</span>') +
+        "</div></details>");
+  }
+  function workerMetaHtml(workerId, d) {
+    var w = d && d.workers ? d.workers.filter(function (x) { return x.id === workerId; })[0] : null;
+    var st = w ? w.state : (S.wState || "DEAD");
+    var tn = stateTone(st);
+    return '<span class="chip t-plain"><span class="dot ' + tn + (tn === "busy" ? " pulse" : "") + '"></span>' + stateName(st) + "</span>" +
+      '<span class="chip t-plain"><span class="ms">tag</span><span class="mono">' + (w && w.pid ? w.pid : "–") + "</span></span>" +
+      '<span class="chip t-plain"><span class="ms">lan</span><span class="mono">' + (w && w.snifferPort ? w.snifferPort : "–") + "</span></span>" +
+      '<span class="chip t-plain"><span class="ms">forum</span>' + (w ? w.activeSessionCount : 0) + " 会话</span>";
+  }
+  function updateWorkerSheetMeta(workerId, d) {
+    var el = $("w-sheet-meta");
+    if (el) el.innerHTML = workerMetaHtml(workerId, d);
+  }
+  function renderWorkerLineHtml(ln) {
+    var sid = ln.sessionId ? '<span class="w-sid">' + esc(ln.sessionId.slice(0, 6)) + "</span>" : "";
+    return '<div class="w-ln ' + esc(ln.stream) + '"><span class="w-ts">' + clockMs(ln.timestamp) + '</span><span class="w-tag ' + esc(ln.stream) + '">' + esc(ln.stream) + "</span>" + sid + '<span class="w-txt">' + esc(ln.text) + "</span></div>";
+  }
+  function renderAllWorkerLogLines() {
+    var box = $("w-live-box");
+    if (!box) return;
+    var list = S.wLogs.filter(function (ln) { return S.wFilter === "all" || ln.stream === S.wFilter; });
+    if (!list.length) {
+      box.innerHTML = empty("terminal", "暂无进程输出");
+      return;
+    }
+    box.innerHTML = list.map(renderWorkerLineHtml).join("");
+    if (S.wStickBottom) box.scrollTop = box.scrollHeight;
+  }
+  function appendWorkerLogLines(newLines) {
+    var box = $("w-live-box");
+    if (!box || !newLines.length) return;
+    var filtered = newLines.filter(function (ln) { return S.wFilter === "all" || ln.stream === S.wFilter; });
+    if (!filtered.length) return;
+    if (box.querySelector(".empty")) box.innerHTML = "";
+    var frag = document.createDocumentFragment();
+    var tmp = document.createElement("div");
+    tmp.innerHTML = filtered.map(renderWorkerLineHtml).join("");
+    while (tmp.firstChild) frag.appendChild(tmp.firstChild);
+    box.appendChild(frag);
+    while (box.childElementCount > 1000) box.removeChild(box.firstChild);
+    if (S.wStickBottom) box.scrollTop = box.scrollHeight;
+  }
+  function workerSheetShell(workerId, d) {
+    return '<div class="live-bar" id="w-sheet-meta">' + workerMetaHtml(workerId, d) + "</div>" +
+      '<div class="live-bar">' +
+      '<div class="seg sm" id="w-filter-seg">' +
+      '<button data-act="w-filter" data-v="all" class="' + (S.wFilter === "all" ? "on" : "") + '">全部</button>' +
+      '<button data-act="w-filter" data-v="stdout" class="' + (S.wFilter === "stdout" ? "on" : "") + '">OUT</button>' +
+      '<button data-act="w-filter" data-v="stderr" class="' + (S.wFilter === "stderr" ? "on" : "") + '">ERR</button>' +
+      '<button data-act="w-filter" data-v="stdin" class="' + (S.wFilter === "stdin" ? "on" : "") + '">IN</button></div>' +
+      '<span class="grow"></span>' +
+      '<button class="icon-btn" id="w-pause-btn" data-act="w-pause" data-tip="' + (S.wPaused ? "继续流式刷新" : "暂停刷新") + '"><span class="ms">' + (S.wPaused ? "play_arrow" : "pause") + "</span></button>" +
+      '<button class="icon-btn" id="w-stick-btn" data-act="w-stick" data-tip="' + (S.wStickBottom ? "已锁定底部" : "滚到底部") + '"><span class="ms' + (S.wStickBottom ? " c-mid" : "") + '">vertical_align_bottom</span></button>' +
+      '<button class="icon-btn" data-act="w-copy" data-tip="复制全部"><span class="ms">content_copy</span></button>' +
+      '<button class="icon-btn" data-act="w-clear" data-id="' + esc(workerId) + '" data-tip="清空"><span class="ms">delete_sweep</span></button></div>' +
+      '<div class="live-log" id="w-live-box">' + empty("terminal", "正在加载即时输出…") + "</div>";
+  }
+  async function pollWorkerLogs(workerId, reset) {
+    if (S.wPolling) return;
+    if (!S.sheet || S.sheet.t !== "worker" || S.sheet.id !== workerId) return;
+    S.wPolling = true;
+    try {
+      var res = await debugApi("worker_logs", { workerId: workerId, afterSeq: reset ? 0 : S.wLastSeq, limit: 500 });
+      if (!S.sheet || S.sheet.t !== "worker" || S.sheet.id !== workerId) return;
+      S.wAlive = Boolean(res.alive);
+      S.wState = res.state || (res.alive ? "IDLE" : "DEAD");
+      var lines = res.lines || [];
+      if (reset) {
+        S.wLogs = lines;
+        S.wLastSeq = Number(res.lastSeq || 0);
+        renderAllWorkerLogLines();
+      } else if (lines.length) {
+        S.wLogs = S.wLogs.concat(lines);
+        if (S.wLogs.length > 1000) S.wLogs = S.wLogs.slice(-1000);
+        S.wLastSeq = Number(res.lastSeq || S.wLastSeq);
+        appendWorkerLogLines(lines);
+      } else if (res.lastSeq != null) {
+        S.wLastSeq = Number(res.lastSeq);
+      }
+      updateWorkerSheetMeta(workerId, S.d);
+    } catch (e) {} finally {
+      S.wPolling = false;
+    }
+  }
   function renderSheet() {
     if (!S.sheet || !S.d) return;
     var d = S.d, body = "", title = "";
+    if (S.sheet.t === "worker") {
+      $("sheet-title").textContent = "进程 " + S.sheet.id;
+      updateWorkerSheetMeta(S.sheet.id, d);
+      return;
+    }
+    if (S.sheet.t === "dlog") {
+      $("sheet-title").textContent = "日志详情";
+      if (S.dlogDetail && S.dlogDetail.id === S.dlogDetailId) return;
+      body = empty("hourglass_top", "加载日志详情…");
+      $("sheet-body").innerHTML = body;
+      return;
+    }
     if (S.sheet.t === "req") {
       var r = d.telemetry.recentRequests.filter(function (x) { return x.requestId === S.sheet.id; })[0];
       title = "请求"; body = r ? reqSheet(r) : empty("history", "记录已滚出窗口");
+    } else if (S.sheet.t === "dsess") {
+      var ds = (S.dsessions || []).filter(function (x) { return x.sessionId === S.sheet.id; })[0];
+      if (!ds) {
+        var ts = d.telemetry.sessions.filter(function (x) { return x.sessionId === S.sheet.id; })[0];
+        if (ts) ds = { sessionId: ts.sessionId, workerId: ts.workerId, createdAt: ts.createdAt, lastLogAt: ts.lastActiveAt, closedAt: ts.status === "CLOSED" ? ts.lastActiveAt : null, status: ts.status, logCount: (S.dsessLogs || []).length, rawLineCount: (S.dsessLogs || []).length, errorCount: 0, baseModelId: ts.baseModelId, lastThinkingLevel: ts.lastThinkingLevel, lastActualModelVersion: ts.lastActualModelVersion };
+      }
+      title = "调试会话"; body = ds ? dsessSheet(ds, d) : empty("history", "会话日志不存在或已过期清理");
     } else {
       var s = d.telemetry.sessions.filter(function (x) { return x.sessionId === S.sheet.id; })[0];
       title = "会话"; body = s ? sessSheet(s, d) : empty("history", "记录不存在");
@@ -1095,11 +1445,70 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   function openSheet(t, id) {
     var changed = !S.sheet || S.sheet.t !== t || S.sheet.id !== id;
     S.sheet = { t: t, id: id };
-    renderSheet();
+    $("sheet").classList.toggle("wide", t === "worker" || t === "dlog");
+    if (t === "worker") {
+      if (changed) {
+        S.wLogs = []; S.wLastSeq = 0; S.wPaused = false; S.wStickBottom = true;
+        $("sheet-title").textContent = "进程 " + id;
+        $("sheet-body").innerHTML = workerSheetShell(id, S.d);
+        var box = $("w-live-box");
+        if (box) {
+          box.addEventListener("scroll", function () {
+            var nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight <= 24;
+            if (S.wStickBottom !== nearBottom) {
+              S.wStickBottom = nearBottom;
+              var sb = $("w-stick-btn");
+              if (sb) sb.querySelector(".ms").classList.toggle("c-mid", nearBottom);
+            }
+          });
+        }
+        pollWorkerLogs(id, true);
+      } else {
+        updateWorkerSheetMeta(id, S.d);
+      }
+    } else if (t === "dlog") {
+      var numId = Number(id);
+      if (changed || S.dlogDetailId !== numId) {
+        S.dlogDetail = null;
+        S.dlogDetailId = numId;
+        renderSheet();
+        debugApi("log_detail", { id: numId }).then(function (res) {
+          if (!S.sheet || S.sheet.t !== "dlog" || Number(S.sheet.id) !== numId) return;
+          S.dlogDetail = res.log || null;
+          $("sheet-title").textContent = "日志详情";
+          $("sheet-body").innerHTML = S.dlogDetail ? dlogSheet(S.dlogDetail) : empty("history", "日志不存在或已清理");
+          $("sheet-body").scrollTop = 0;
+        }).catch(function () {
+          if (!S.sheet || S.sheet.t !== "dlog" || Number(S.sheet.id) !== numId) return;
+          $("sheet-body").innerHTML = empty("error", "加载失败或日志已过期清理");
+        });
+      }
+    } else if (t === "dsess") {
+      if (changed) S.dsessLogs = [];
+      renderSheet();
+      if (!S.dsessions.length) {
+        debugApi("sessions", { limit: 150 }).then(function (sr) {
+          S.dsessions = sr.sessions || [];
+          if (S.sheet && S.sheet.t === "dsess" && S.sheet.id === id) renderSheet();
+        }).catch(function () {});
+      }
+      debugApi("logs", { sessionId: id, limit: 200 }).then(function (res) {
+        if (!S.sheet || S.sheet.t !== "dsess" || S.sheet.id !== id) return;
+        S.dsessLogs = res.logs || [];
+        renderSheet();
+      }).catch(function () {});
+    } else {
+      renderSheet();
+    }
     if (changed) $("sheet-body").scrollTop = 0;
     $("sheet").classList.add("on"); $("scrim").classList.add("on");
   }
-  function closeSheet() { S.sheet = null; $("sheet").classList.remove("on"); $("scrim").classList.remove("on"); }
+  function closeSheet() {
+    S.sheet = null;
+    $("sheet").classList.remove("on");
+    $("sheet").classList.remove("wide");
+    $("scrim").classList.remove("on");
+  }
 
   /* ---------- infra ---------- */
   function resolveResourceUrl(relPath) {
@@ -1122,7 +1531,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       r = await fetch(tunnelUrl, { method: "GET", cache: "no-store", headers: Object.keys(hdrs).length ? hdrs : undefined });
     } else {
       if (body) hdrs["Content-Type"] = "application/json";
-      r = await fetch(resolveApiUrl(url), { method: method, headers: Object.keys(hdrs).length ? hdrs : undefined, body: body ? JSON.stringify(body) : undefined });
+      r = await fetch(resolveApiUrl(url), { method: method, cache: "no-store", headers: Object.keys(hdrs).length ? hdrs : undefined, body: body ? JSON.stringify(body) : undefined });
     }
     var j = {};
     try { j = await r.json(); } catch (e) {}
@@ -1186,9 +1595,16 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     if (d.pool.queuedRequests > 0) { b.textContent = d.pool.queuedRequests; b.className = "badge on err"; }
     else if (d.pool.busyWorkers > 0) { b.textContent = d.pool.busyWorkers; b.className = "badge on"; }
     else b.className = "badge";
+    var db = $("badge-dbg");
+    if (db) {
+      var errN = d.debugSummary && d.debugSummary.totalErrors ? d.debugSummary.totalErrors : 0;
+      if (errN > 0) { db.textContent = errN > 99 ? "99+" : errN; db.className = "badge on err"; }
+      else db.className = "badge";
+    }
     if (S.page === "home") renderHome(d);
     else if (S.page === "traffic") renderTraffic(d);
     else if (S.page === "runtime") renderRuntime(d);
+    else if (S.page === "debug") renderDebug(d);
     else if (S.page === "settings") initSettings(d);
     if (S.sheet) renderSheet();
   }
@@ -1203,6 +1619,9 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       S.last = Date.now();
       setSync(true);
       render();
+      if (S.page === "debug" || (S.sheet && S.sheet.t === "dsess")) {
+        fetchDebugData();
+      }
     } catch (e) { setSync(false); }
   }
   function go(p) {
@@ -1212,6 +1631,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     document.querySelectorAll(".page").forEach(function (n) { n.classList.toggle("on", n.id === "page-" + p); });
     $("title").textContent = TITLES[p];
     render();
+    if (p === "debug") fetchDebugData();
   }
 
   /* ---------- events ---------- */
@@ -1225,8 +1645,74 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       if (a === "nav") { location.hash = el.getAttribute("data-page"); }
       else if (a === "open-req") { e.stopPropagation(); openSheet("req", el.getAttribute("data-id")); }
       else if (a === "open-sess") { e.stopPropagation(); openSheet("sess", el.getAttribute("data-id")); }
+      else if (a === "open-dsess") { e.stopPropagation(); openSheet("dsess", el.getAttribute("data-id")); }
+      else if (a === "open-dlog") { e.stopPropagation(); openSheet("dlog", el.getAttribute("data-id")); }
+      else if (a === "open-worker") { e.stopPropagation(); openSheet("worker", el.getAttribute("data-id")); }
       else if (a === "close-sheet") closeSheet();
       else if (a === "tab") { S.tab = el.getAttribute("data-tab"); render(); }
+      else if (a === "dtab") { S.dtab = el.getAttribute("data-tab"); renderDebug(S.d); fetchDebugData(); }
+      else if (a === "filter-dsess") {
+        e.stopPropagation();
+        S.dsess = el.getAttribute("data-id") || "";
+        S.dtab = "log";
+        if (S.sheet && S.sheet.t === "dsess") closeSheet();
+        if (S.page !== "debug") location.hash = "debug";
+        else { renderDebug(S.d); fetchDebugData(); }
+      }
+      else if (a === "clear-dsess-filter") { S.dsess = ""; renderDebug(S.d); fetchDebugData(); }
+      else if (a === "clear-dlogs") {
+        var msgTxt = S.dsess ? "清空会话 " + S.dsess.slice(0, 8) + " 的所有调试日志？" : "清空全部会话的调试日志？";
+        if (await confirmDlg("delete_sweep", "清空调试日志", msgTxt, "清空")) {
+          await debugApi("clear_logs", S.dsess ? { sessionId: S.dsess } : {});
+          snack("已清空调试日志");
+          fetchDebugData(); poll();
+        }
+      }
+      else if (a === "clear-dsess-logs") {
+        var dsid = el.getAttribute("data-id");
+        if (await confirmDlg("delete", "清空会话日志", dsid + " 的全部调试日志将被删除", "删除")) {
+          await debugApi("clear_logs", { sessionId: dsid });
+          S.dsessLogs = [];
+          snack("已清空 " + dsid.slice(0, 8));
+          closeSheet(); fetchDebugData(); poll();
+        }
+      }
+      else if (a === "copy-dlog") {
+        if (S.dlogDetail) copyText(S.dlogDetail.content || "");
+      }
+      else if (a === "w-filter") {
+        S.wFilter = el.getAttribute("data-v") || "all";
+        document.querySelectorAll("#w-filter-seg button").forEach(function (b) { b.classList.toggle("on", b.getAttribute("data-v") === S.wFilter); });
+        renderAllWorkerLogLines();
+      }
+      else if (a === "w-pause") {
+        S.wPaused = !S.wPaused;
+        var pb = $("w-pause-btn");
+        if (pb) {
+          pb.setAttribute("data-tip", S.wPaused ? "继续流式刷新" : "暂停刷新");
+          pb.querySelector(".ms").textContent = S.wPaused ? "play_arrow" : "pause";
+        }
+        if (!S.wPaused && S.sheet && S.sheet.t === "worker") pollWorkerLogs(S.sheet.id, false);
+      }
+      else if (a === "w-stick") {
+        S.wStickBottom = true;
+        var box = $("w-live-box");
+        if (box) box.scrollTop = box.scrollHeight;
+        var sb = $("w-stick-btn");
+        if (sb) sb.querySelector(".ms").classList.add("c-mid");
+      }
+      else if (a === "w-copy") {
+        var txt = S.wLogs.filter(function (ln) { return S.wFilter === "all" || ln.stream === S.wFilter; })
+          .map(function (ln) { return clockMs(ln.timestamp) + " [" + ln.stream.toUpperCase() + "] " + ln.text; }).join("\n");
+        copyText(txt);
+      }
+      else if (a === "w-clear") {
+        var wid = el.getAttribute("data-id");
+        await debugApi("clear_worker_logs", { workerId: wid });
+        S.wLogs = [];
+        renderAllWorkerLogLines();
+        snack("已清空进程日志");
+      }
       else if (a === "refresh") poll();
       else if (a === "theme") {
         var t = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
@@ -1234,6 +1720,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       }
       else if (a === "copy") copyText(el.getAttribute("data-copy"));
       else if (a === "kill") {
+        e.stopPropagation();
         var id = el.getAttribute("data-id");
         if (await confirmDlg("power_settings_new", "销毁进程", id + " 上的会话将全部关闭", "销毁")) {
           await api("DELETE", "./api/admin/workers?id=" + encodeURIComponent(id)); snack("已销毁 " + id); poll();
@@ -1281,6 +1768,11 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
 
   $("settings-form").addEventListener("input", function () { updateTtlHint(); if (!S.cfgReady) return; setDirty(true); });
   $("q").addEventListener("input", function (e) { S.q = e.target.value; if (S.d) renderTraffic(S.d); });
+  $("dq").addEventListener("input", function (e) {
+    S.dq = e.target.value;
+    if (S.d) renderDebug(S.d);
+    if (S.dtab === "log") fetchDebugData();
+  });
   document.addEventListener("keydown", function (e) { if (e.key === "Escape" && S.sheet) closeSheet(); });
 
   var tipEl = $("tip");
@@ -1302,6 +1794,11 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   go(location.hash.slice(1) || "home");
   poll();
   setInterval(function () { if (!document.hidden) poll(); }, 2000);
+  setInterval(function () {
+    if (!document.hidden && S.sheet && S.sheet.t === "worker" && !S.wPaused) {
+      pollWorkerLogs(S.sheet.id, false);
+    }
+  }, 400);
 </script>
 </body>
 </html>`;

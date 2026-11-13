@@ -15,6 +15,7 @@ export interface GatewayConfig {
   maxWorkers: number;
   workerIdleTtlMs: number;
   sessionTtlMs: number;
+  logRetentionMs: number;
   requestTimeoutMs: number;
   uiLayout: UiLayout;
 }
@@ -36,6 +37,7 @@ const defaultConfig: GatewayConfig = {
     10
   ),
   sessionTtlMs: parseInt(process.env.AGY_SESSION_TTL_MS || "1800000", 10),
+  logRetentionMs: parseInt(process.env.AGY_LOG_RETENTION_MS || "3600000", 10),
   requestTimeoutMs: parseInt(
     process.env.AGY_REQUEST_TIMEOUT_MS || "300000",
     10
@@ -101,6 +103,16 @@ export function updateGatewayConfig(
     config.sessionTtlMs = Math.floor(patch.sessionTtlMs);
   }
   if (
+    typeof patch.logRetentionMs === "number" &&
+    !Number.isNaN(patch.logRetentionMs) &&
+    patch.logRetentionMs >= 0
+  ) {
+    config.logRetentionMs = Math.max(
+      0,
+      Math.min(7 * 86400_000, Math.floor(patch.logRetentionMs))
+    );
+  }
+  if (
     typeof patch.requestTimeoutMs === "number" &&
     patch.requestTimeoutMs >= 5000
   ) {
@@ -120,6 +132,7 @@ export function updateGatewayConfig(
       maxWorkers: config.maxWorkers,
       workerIdleTtlMs: config.workerIdleTtlMs,
       sessionTtlMs: config.sessionTtlMs,
+      logRetentionMs: config.logRetentionMs,
       requestTimeoutMs: config.requestTimeoutMs,
       uiLayout: config.uiLayout,
     };

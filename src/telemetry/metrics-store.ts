@@ -58,6 +58,9 @@ const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "telemetry.db");
 
 export class TelemetryStore {
   private db: DatabaseSync;
+  private sessionClosedListeners: Array<(sessionId: string) => void> = [];
+  private workerSessionsClosedListeners: Array<(workerId: string) => void> = [];
+  private beforeCloseListeners: Array<() => void> = [];
 
   constructor(dbPath: string = DEFAULT_DB_PATH) {
     if (dbPath !== ":memory:") {
@@ -66,6 +69,22 @@ export class TelemetryStore {
 
     this.db = new DatabaseSync(dbPath);
     this.initSchema();
+  }
+
+  public getDb(): DatabaseSync {
+    return this.db;
+  }
+
+  public onSessionClosed(fn: (sessionId: string) => void): void {
+    this.sessionClosedListeners.push(fn);
+  }
+
+  public onWorkerSessionsClosed(fn: (workerId: string) => void): void {
+    this.workerSessionsClosedListeners.push(fn);
+  }
+
+  public onBeforeClose(fn: () => void): void {
+    this.beforeCloseListeners.push(fn);
   }
 
   private initSchema(): void {
@@ -168,6 +187,11 @@ export class TelemetryStore {
       WHERE session_id = ?
     `);
     stmt.run(Date.now(), sessionId);
+    for (const fn of this.sessionClosedListeners) {
+      try {
+        fn(sessionId);
+      } catch {}
+    }
   }
 
   public markWorkerSessionsClosed(workerId: string): void {
@@ -177,6 +201,11 @@ export class TelemetryStore {
       WHERE worker_id = ? AND status = 'ACTIVE'
     `);
     stmt.run(Date.now(), workerId);
+    for (const fn of this.workerSessionsClosedListeners) {
+      try {
+        fn(workerId);
+      } catch {}
+    }
   }
 
   public recordCompletedRequest(
@@ -450,6 +479,11 @@ export class TelemetryStore {
   }
 
   public close(): void {
+    for (const fn of this.beforeCloseListeners) {
+      try {
+        fn();
+      } catch {}
+    }
     try {
       this.db.close();
     } catch {}

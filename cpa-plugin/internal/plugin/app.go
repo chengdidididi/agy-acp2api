@@ -257,6 +257,11 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodDelete, Path: base + "/api/admin/workers", Description: "销毁指定的 ACP Worker 进程"},
 			{Method: http.MethodPost, Path: base + "/api/admin/sessions/clear-cache", Description: "清空会话前缀哈希缓存"},
 			{Method: http.MethodDelete, Path: base + "/api/admin/sessions", Description: "关闭指定的存续 ACP 会话"},
+			{Method: http.MethodGet, Path: base + "/api/admin/debug/sessions", Description: "获取调试会话日志摘要列表"},
+			{Method: http.MethodGet, Path: base + "/api/admin/debug/logs", Description: "获取或筛选会话调试日志"},
+			{Method: http.MethodDelete, Path: base + "/api/admin/debug/logs", Description: "清理会话调试日志"},
+			{Method: http.MethodGet, Path: base + "/api/admin/debug/worker-logs", Description: "获取进程即时输出日志"},
+			{Method: http.MethodDelete, Path: base + "/api/admin/debug/worker-logs", Description: "清空进程即时输出日志"},
 			{Method: http.MethodGet, Path: base + "/health", Description: "检查本地 agy-acp2api 健康状态"},
 		},
 		Resources: []ResourceRoute{
@@ -292,6 +297,18 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{
 				Path:        "/api/admin/sessions",
 				Description: "直连模式会话关闭转发",
+			},
+			{
+				Path:        "/api/admin/debug/sessions",
+				Description: "直连模式调试会话列表转发",
+			},
+			{
+				Path:        "/api/admin/debug/logs",
+				Description: "直连模式调试日志查询转发",
+			},
+			{
+				Path:        "/api/admin/debug/worker-logs",
+				Description: "直连模式进程即时日志转发",
 			},
 		},
 	}

@@ -21,12 +21,15 @@ import {
   computeUserFingerprint,
 } from "../src/compiler/session-hash.js";
 import {
-   TelemetryStore,
+  TelemetryStore,
   telemetryStore,
 } from "../src/telemetry/metrics-store.js";
+import { DebugLogStore, debugStore } from "../src/telemetry/debug-store.js";
 import { ToolCallStreamParser } from "../src/parser/stream-parser.js";
+import { AcpWorker, sanitizePayloadForLog } from "../src/pool/acp-worker.js";
 import { WorkerPool } from "../src/pool/worker-pool.js";
 import { createGatewayApp } from "../src/server/app.js";
+import { renderDashboardHtml } from "../src/server/dashboard-ui.js";
 import {
   OpenAIChatCompletionChunk,
   OpenAIMessage,
@@ -730,11 +733,263 @@ async function testMultimodalImageCompilerUnit() {
   );
 }
 
+async function testDebugLoggingAndRetentionUnit() {
+  console.log(
+    "2d. [Unit Test] Testing DebugLogStore Coalescing, Retention, Live Worker Ring & Admin Endpoints..."
+  );
+
+  // 1. Validate Dashboard HTML embedded scripts compile cleanly & have zero unescaped template interpolations
+  const html = renderDashboardHtml();
+  assert.ok(!html.includes("${"), "Dashboard HTML must not contain '${'");
+  const scriptMatches = Array.from(html.matchAll(/<script>([\s\S]*?)<\/script>/g));
+  assert.ok(scriptMatches.length >= 2, "Expected embedded script tags in Dashboard HTML");
+  for (const m of scriptMatches) {
+    assert.doesNotThrow(() => new Function(m[1]), "Embedded dashboard JS must parse cleanly");
+  }
+  assert.ok(html.includes('id="page-debug"'));
+  assert.ok(html.includes('id="f-logRet"'));
+
+  // 2. Test Base64 sanitization for multimodal stdin logging
+  const sanitized = sanitizePayloadForLog({
+    jsonrpc: "2.0",
+    id: 10,
+    method: "session/prompt",
+    params: {
+      sessionId: "s-img",
+      prompt: [
+        { type: "text", text: "Look at this" },
+        { type: "image", mimeType: "image/png", data: "AAAA".repeat(100) },
+      ],
+    },
+  }) as any;
+  assert.equal(sanitized.params.prompt[1].data, "[base64 omitted, 400 chars]");
+
+  // 3. Test DebugLogStore chunk coalescing, chronological splitting, persistence & retention
+  const tmpDbPath = path.join(os.tmpdir(), `agy2api-debug-test-${Date.now()}.db`);
+  const tStore = new TelemetryStore(tmpDbPath);
+  const dStore = new DebugLogStore(tStore);
+
+  dStore.registerSession("s-act", "w-1", "ACTIVE");
+  dStore.registerSession("s-cls", "w-1", "ACTIVE");
+
+  const t0 = 1_000_000;
+  dStore.appendStreamChunk({
+    sessionId: "s-cls",
+    workerId: "w-1",
+    category: "thought",
+    method: "session/update:agent_thought_chunk",
+    text: "Think 1 ",
+    rawFrame: '{"t":1}',
+    timestamp: t0,
+  });
+  dStore.appendStreamChunk({
+    sessionId: "s-cls",
+    workerId: "w-1",
+    category: "thought",
+    method: "session/update:agent_thought_chunk",
+    text: "Think 2",
+    rawFrame: '{"t":2}',
+    timestamp: t0 + 10,
+  });
+  dStore.appendStreamChunk({
+    sessionId: "s-cls",
+    workerId: "w-1",
+    category: "message",
+    method: "session/update:agent_message_chunk",
+    text: "Hello ",
+    rawFrame: '{"m":1}',
+    timestamp: t0 + 20,
+  });
+  dStore.recordEvent({
+    sessionId: "s-cls",
+    workerId: "w-1",
+    direction: "stdout",
+    category: "tool_call",
+    method: "session/update:tool_call",
+    summary: "read_file",
+    content: '{"title":"read_file"}',
+    rawFrame: '{"tool":1}',
+    timestamp: t0 + 30,
+  });
+  dStore.appendStreamChunk({
+    sessionId: "s-cls",
+    workerId: "w-1",
+    category: "message",
+    method: "session/update:agent_message_chunk",
+    text: "World!",
+    rawFrame: '{"m":2}',
+    timestamp: t0 + 40,
+  });
+
+  // Live overlay before flush should reflect coalesced text & chunkCount
+  const preFlushLogs = dStore.getLogs({ sessionId: "s-cls" });
+  assert.equal(preFlushLogs.length, 4); // thought(x2), message(Hello), tool_call, message(World!)
+  assert.equal(preFlushLogs[3].category, "thought");
+  assert.equal(preFlushLogs[3].chunkCount, 2);
+  const thoughtDetail = dStore.getLogDetail(preFlushLogs[3].id)!;
+  assert.equal(thoughtDetail.content, "Think 1 Think 2");
+  assert.equal(thoughtDetail.rawFrames.length, 2);
+
+  // Close s-cls & reopen DB to test startup recovery + persistence
+  tStore.markSessionClosed("s-cls");
+  tStore.close();
+
+  const tStore2 = new TelemetryStore(tmpDbPath);
+  const dStore2 = new DebugLogStore(tStore2);
+  const recovered = dStore2.getSessions();
+  assert.equal(recovered.length, 2);
+  assert.ok(recovered.every((s) => s.status === "CLOSED"));
+
+  // Re-activate s-act to ensure ACTIVE sessions are never pruned
+  dStore2.registerSession("s-act", "w-1", "ACTIVE");
+  dStore2.recordEvent({
+    sessionId: "s-act",
+    workerId: "w-1",
+    direction: "stdin",
+    category: "rpc_req",
+    method: "session/prompt",
+    summary: "hi",
+    content: "{}",
+    rawFrame: "{}",
+  });
+
+  const closedRow = dStore2.getSessions().find((s) => s.sessionId === "s-cls")!;
+  assert.ok(closedRow.closedAt !== null);
+
+  // Before retention expires: both remain
+  const prunedEarly = dStore2.pruneExpired(60_000, closedRow.closedAt! + 10_000);
+  assert.equal(prunedEarly, 0);
+  assert.equal(dStore2.getSessions().length, 2);
+
+  // After retention expires: closed session deleted, active session preserved
+  const prunedLate = dStore2.pruneExpired(60_000, closedRow.closedAt! + 60_001);
+  assert.equal(prunedLate, 1);
+  const remaining = dStore2.getSessions();
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].sessionId, "s-act");
+  assert.equal(dStore2.getLogs({ sessionId: "s-cls" }).length, 0);
+  tStore2.close();
+  fs.rmSync(tmpDbPath, { force: true });
+
+  // 4. Test AcpWorker live log ring buffer & WorkerPool dead-worker log snapshot + Admin HTTP routes
+  const settingsPath = path.resolve(process.cwd(), "settings.json");
+  const hadSettings = fs.existsSync(settingsPath);
+  const settingsBackup = hadSettings ? fs.readFileSync(settingsPath, "utf-8") : null;
+  const origRetention = config.logRetentionMs;
+
+  const mockWorker = new AcpWorker("dbg-w1");
+  (mockWorker as any).pushLiveLog("stdout", "dbg-s1", '{"line":1}', 1000);
+  (mockWorker as any).pushLiveLog("stderr", "dbg-s1", "warn line", 1001);
+  const allLive = mockWorker.getLiveLogs(0, 50);
+  assert.equal(allLive.lines.length, 2);
+  const deltaLive = mockWorker.getLiveLogs(allLive.lines[0].seq, 50);
+  assert.equal(deltaLive.lines.length, 1);
+  assert.equal(deltaLive.lines[0].stream, "stderr");
+
+  const mockPool = new WorkerPool();
+  (mockPool as any).workers.set("dbg-w1", mockWorker);
+
+  debugStore.recordEvent({
+    sessionId: "dbg-http-s1",
+    workerId: "dbg-w1",
+    direction: "stdout",
+    category: "stdout_raw",
+    method: "stdout",
+    summary: "http test line",
+    content: "http test line content",
+    rawFrame: "http test line content",
+  });
+
+  const app = createGatewayApp(mockPool);
+  let listenPort = 0;
+  const srv = await new Promise<ReturnType<typeof serve>>((resolve) => {
+    const s = serve({ fetch: app.fetch, hostname: "127.0.0.1", port: 0 }, (info) => {
+      listenPort = info.port;
+      resolve(s);
+    });
+  });
+  try {
+    const u = `http://127.0.0.1:${listenPort}`;
+
+    const rSess = await fetch(`${u}/api/admin/debug/sessions`);
+    assert.equal(rSess.status, 200);
+    const jSess = (await rSess.json()) as any;
+    assert.ok(jSess.sessions.some((x: any) => x.sessionId === "dbg-http-s1"));
+
+    const rLogs = await fetch(`${u}/api/admin/debug/logs?sessionId=dbg-http-s1`);
+    assert.equal(rLogs.status, 200);
+    const jLogs = (await rLogs.json()) as any;
+    assert.equal(jLogs.logs.length, 1);
+
+    const logId = jLogs.logs[0].id;
+    const rDetail = await fetch(`${u}/api/admin/debug/logs/${logId}`);
+    assert.equal(rDetail.status, 200);
+    const jDetail = (await rDetail.json()) as any;
+    assert.equal(jDetail.log.content, "http test line content");
+
+    const rWorker = await fetch(`${u}/api/admin/workers/dbg-w1/logs`);
+    assert.equal(rWorker.status, 200);
+    const jWorker = (await rWorker.json()) as any;
+    assert.equal(jWorker.lines.length, 2);
+
+    // Terminate worker -> dead worker snapshot remains queryable
+    mockPool.terminateWorker("dbg-w1");
+    const rDeadWorker = await fetch(`${u}/api/admin/debug/worker-logs?workerId=dbg-w1`);
+    assert.equal(rDeadWorker.status, 200);
+    const jDeadWorker = (await rDeadWorker.json()) as any;
+    assert.equal(jDeadWorker.alive, false);
+    assert.ok(jDeadWorker.lines.length >= 2);
+
+    // CPA _debug tunnel dispatch works on /api/admin/overview
+    const rCpa = await fetch(`${u}/api/admin/overview?_debug=logs&sessionId=dbg-http-s1`);
+    assert.equal(rCpa.status, 200);
+    const jCpa = (await rCpa.json()) as any;
+    assert.equal(jCpa.logs.length, 1);
+
+    // Config endpoint accepts logRetentionMs
+    const rCfg = await fetch(`${u}/api/admin/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ logRetentionMs: 120000 }),
+    });
+    assert.equal(rCfg.status, 200);
+    const jCfg = (await rCfg.json()) as any;
+    assert.equal(jCfg.config.logRetentionMs, 120000);
+
+    // Clean up test session log
+    const rClr = await fetch(`${u}/api/admin/debug/logs?sessionId=dbg-http-s1`, {
+      method: "DELETE",
+    });
+    assert.equal(rClr.status, 200);
+  } finally {
+    srv.close();
+    mockPool.shutdown();
+    debugStore.clearLogs("dbg-http-s1");
+    config.logRetentionMs = origRetention;
+    if (hadSettings && settingsBackup !== null) {
+      fs.writeFileSync(settingsPath, settingsBackup, "utf-8");
+    } else if (!hadSettings && fs.existsSync(settingsPath)) {
+      fs.rmSync(settingsPath, { force: true });
+    }
+  }
+
+  console.log(
+    "   -> Passed! DebugLogStore coalescing, retention pruning, live worker ring, CPA tunnel & HTML JS validation verified."
+  );
+}
+
 async function runIntegrationTest() {
   testSlidingWindowParserUnit();
   testUnifiedModelAndEffortResolverUnit();
   testSessionAnchorAndPromptFramingUnit();
   await testMultimodalImageCompilerUnit();
+  await testDebugLoggingAndRetentionUnit();
+
+  if (process.argv.includes("--unit-only")) {
+    telemetryStore.close();
+    console.log("\nALL UNIT & ADMIN HTTP TESTS PASSED SUCCESSFULLY!");
+    return;
+  }
 
   console.log("\n3. [E2E Test] Booting WorkerPool and Hono Gateway Server...");
   const pool = new WorkerPool();

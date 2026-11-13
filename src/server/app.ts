@@ -13,6 +13,7 @@ import {
 import { ToolCallStreamParser } from "../parser/stream-parser.js";
 import { PromptInterruptedError } from "../pool/acp-worker.js";
 import { WorkerPool } from "../pool/worker-pool.js";
+import { debugStore } from "../telemetry/debug-store.js";
 import { telemetryStore } from "../telemetry/metrics-store.js";
 import { AcpPromptContentBlock } from "../types/acp.js";
 import {
@@ -52,6 +53,55 @@ export function createGatewayApp(pool: WorkerPool): Hono {
   });
 
   app.get("/api/admin/overview", (c) => {
+    const debugOp = c.req.query("_debug");
+    if (debugOp) {
+      debugStore.pruneExpired(config.logRetentionMs);
+      if (debugOp === "sessions") {
+        const limit = Number(c.req.query("limit") || "100");
+        return c.json({
+          status: "ok",
+          sessions: debugStore.getSessions(limit),
+          summary: debugStore.getSummary(),
+        });
+      }
+      if (debugOp === "logs") {
+        const sessionId = c.req.query("sessionId") || undefined;
+        const q = c.req.query("q") || undefined;
+        const limit = Number(c.req.query("limit") || "200");
+        return c.json({
+          status: "ok",
+          logs: debugStore.getLogs({ sessionId, q, limit }),
+        });
+      }
+      if (debugOp === "log_detail") {
+        const id = Number(c.req.query("id"));
+        const log = debugStore.getLogDetail(id);
+        if (!log) return c.json({ status: "not_found" }, 404);
+        return c.json({ status: "ok", log });
+      }
+      if (debugOp === "worker_logs") {
+        const workerId = c.req.query("workerId") || "";
+        const afterSeq = Number(c.req.query("afterSeq") || "0");
+        const limit = Number(c.req.query("limit") || "500");
+        return c.json({
+          status: "ok",
+          ...pool.getWorkerLogs(workerId, afterSeq, limit),
+        });
+      }
+      if (debugOp === "clear_logs") {
+        const sessionId = c.req.query("sessionId") || undefined;
+        return c.json({
+          status: "ok",
+          deleted: debugStore.clearLogs(sessionId),
+        });
+      }
+      if (debugOp === "clear_worker_logs") {
+        const workerId = c.req.query("workerId") || "";
+        const ok = workerId ? pool.clearWorkerLogs(workerId) : false;
+        return c.json({ status: ok ? "ok" : "not_found" });
+      }
+    }
+
     const rawModels = pool.getAvailableModels();
     const unifiedModels = buildUnifiedModelCatalog(rawModels);
     return c.json({
@@ -60,6 +110,7 @@ export function createGatewayApp(pool: WorkerPool): Hono {
       config,
       unifiedModels,
       telemetry: telemetryStore.getSnapshot(),
+      debugSummary: debugStore.getSummary(),
     });
   });
 
@@ -144,6 +195,86 @@ export function createGatewayApp(pool: WorkerPool): Hono {
   };
   app.delete("/api/admin/sessions", handleDeleteSession);
   app.get("/api/admin/sessions", handleDeleteSession);
+
+  // Debug & Live Worker Log APIs
+  app.get("/api/admin/debug/sessions", (c) => {
+    debugStore.pruneExpired(config.logRetentionMs);
+    const limit = Number(c.req.query("limit") || "100");
+    return c.json({
+      status: "ok",
+      sessions: debugStore.getSessions(limit),
+      summary: debugStore.getSummary(),
+    });
+  });
+
+  app.get("/api/admin/debug/logs", (c) => {
+    debugStore.pruneExpired(config.logRetentionMs);
+    const sessionId = c.req.query("sessionId") || undefined;
+    const q = c.req.query("q") || undefined;
+    const limit = Number(c.req.query("limit") || "200");
+    return c.json({
+      status: "ok",
+      logs: debugStore.getLogs({ sessionId, q, limit }),
+    });
+  });
+
+  app.get("/api/admin/debug/logs/:id", (c) => {
+    const id = Number(c.req.param("id"));
+    const log = debugStore.getLogDetail(id);
+    if (!log) {
+      return c.json({ status: "not_found" }, 404);
+    }
+    return c.json({ status: "ok", log });
+  });
+
+  const handleClearDebugLogs = async (c: any) => {
+    let sessionId = c.req.query("sessionId") || "";
+    if (!sessionId && c.req.method !== "GET") {
+      try {
+        const body = await c.req.json();
+        sessionId = body?.sessionId || "";
+      } catch {}
+    }
+    const deleted = debugStore.clearLogs(sessionId || undefined);
+    return c.json({ status: "ok", deleted });
+  };
+  app.delete("/api/admin/debug/logs", handleClearDebugLogs);
+  app.post("/api/admin/debug/logs/clear", handleClearDebugLogs);
+  app.get("/api/admin/debug/logs/clear", handleClearDebugLogs);
+
+  app.get("/api/admin/debug/worker-logs", (c) => {
+    const workerId = c.req.query("workerId") || "";
+    const afterSeq = Number(c.req.query("afterSeq") || "0");
+    const limit = Number(c.req.query("limit") || "500");
+    return c.json({
+      status: "ok",
+      ...pool.getWorkerLogs(workerId, afterSeq, limit),
+    });
+  });
+
+  app.get("/api/admin/workers/:id/logs", (c) => {
+    const workerId = c.req.param("id");
+    const afterSeq = Number(c.req.query("afterSeq") || "0");
+    const limit = Number(c.req.query("limit") || "500");
+    return c.json({
+      status: "ok",
+      ...pool.getWorkerLogs(workerId, afterSeq, limit),
+    });
+  });
+
+  const handleClearWorkerLogs = async (c: any) => {
+    let workerId = c.req.param("id") || c.req.query("workerId") || "";
+    if (!workerId && c.req.method !== "GET") {
+      try {
+        const body = await c.req.json();
+        workerId = body?.workerId || "";
+      } catch {}
+    }
+    const ok = workerId ? pool.clearWorkerLogs(workerId) : false;
+    return c.json({ status: ok ? "ok" : "not_found" });
+  };
+  app.delete("/api/admin/debug/worker-logs", handleClearWorkerLogs);
+  app.delete("/api/admin/workers/:id/logs", handleClearWorkerLogs);
 
   // ============================================================================
   // 2. OpenAI v1 Bearer Auth Middleware

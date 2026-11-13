@@ -4,9 +4,14 @@ import {
   SessionAffinityRegistry,
   computeToolsSignature,
 } from "../compiler/session-hash.js";
+import { debugStore } from "../telemetry/debug-store.js";
 import { AcpModelInfo } from "../types/acp.js";
 import { OpenAIMessage, OpenAIToolDefinition } from "../types/openai.js";
-import { AcpWorker, PromptInterruptedError } from "./acp-worker.js";
+import {
+  AcpWorker,
+  PromptInterruptedError,
+  WorkerLiveLogLine,
+} from "./acp-worker.js";
 import { sweepStaleSandboxes } from "./sandbox.js";
 
 export interface LeaseAcquisition {
@@ -47,8 +52,18 @@ const DEFAULT_FALLBACK_MODELS: AcpModelInfo[] = [
   { modelId: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
 ];
 
+const MAX_EXITED_WORKER_LOG_SNAPSHOTS = 12;
+
+interface ExitedWorkerLogSnapshot {
+  workerId: string;
+  closedAt: number;
+  lastSeq: number;
+  lines: WorkerLiveLogLine[];
+}
+
 export class WorkerPool {
   private workers = new Map<string, AcpWorker>();
+  private exitedWorkerLogs = new Map<string, ExitedWorkerLogSnapshot>();
   private waitQueue: QueuedWaiter[] = [];
   private sweepInterval: NodeJS.Timeout | null = null;
   private cachedModels: AcpModelInfo[] = [...DEFAULT_FALLBACK_MODELS];
@@ -60,6 +75,8 @@ export class WorkerPool {
       this.sessionRegistry.setTtlMs(newCfg.sessionTtlMs, (wId, sId) => {
         this.workers.get(wId)?.closeSession(sId).catch(() => {});
       });
+      debugStore.pruneExpired(newCfg.logRetentionMs);
+      this.pruneExitedWorkerLogs(newCfg.logRetentionMs);
       this.ensureMinWorkers();
       this.reapIdleBurstWorkers();
     });
@@ -351,8 +368,69 @@ export class WorkerPool {
         createdAt: w.createdAt,
         lastUsedAt: w.lastUsedAt,
         idleTtlRemainingMs,
+        liveLogCount: w.getLiveLogCount(),
+        lastLogSeq: w.getLastLogSeq(),
       };
     });
+  }
+
+  public getWorkerLogs(
+    workerId: string,
+    afterSeq: number = 0,
+    limit: number = 500
+  ): {
+    workerId: string;
+    alive: boolean;
+    state: string;
+    lines: WorkerLiveLogLine[];
+    lastSeq: number;
+    totalLines: number;
+  } {
+    const w = this.workers.get(workerId);
+    if (w) {
+      const res = w.getLiveLogs(afterSeq, limit);
+      return {
+        workerId,
+        alive: w.state !== "DEAD",
+        state: w.state,
+        ...res,
+      };
+    }
+
+    const snap = this.exitedWorkerLogs.get(workerId);
+    if (snap) {
+      const safeLimit = Math.max(1, Math.min(1000, limit));
+      const filtered =
+        afterSeq > 0
+          ? snap.lines.filter((l) => l.seq > afterSeq)
+          : snap.lines.slice(-safeLimit);
+      return {
+        workerId,
+        alive: false,
+        state: "DEAD",
+        lines: filtered.length > safeLimit ? filtered.slice(-safeLimit) : filtered,
+        lastSeq: snap.lastSeq,
+        totalLines: snap.lines.length,
+      };
+    }
+
+    return {
+      workerId,
+      alive: false,
+      state: "DEAD",
+      lines: [],
+      lastSeq: 0,
+      totalLines: 0,
+    };
+  }
+
+  public clearWorkerLogs(workerId: string): boolean {
+    const w = this.workers.get(workerId);
+    if (w) {
+      w.clearLiveLogs();
+      return true;
+    }
+    return this.exitedWorkerLogs.delete(workerId);
   }
 
   public async spawnManualWorker(): Promise<AcpWorker> {
@@ -365,9 +443,11 @@ export class WorkerPool {
   public terminateWorker(workerId: string): boolean {
     const w = this.workers.get(workerId);
     if (!w) return false;
+    this.snapshotWorkerLogs(w);
     this.workers.delete(workerId);
     this.sessionRegistry.removeWorkerSessions(workerId);
     w.destroy();
+    this.snapshotWorkerLogs(w);
     this.ensureMinWorkers();
     return true;
   }
@@ -403,6 +483,10 @@ export class WorkerPool {
   private async spawnNewWorker(): Promise<AcpWorker> {
     const id = crypto.randomUUID().slice(0, 8);
     const worker = new AcpWorker(id, (deadId) => {
+      const deadW = this.workers.get(deadId);
+      if (deadW) {
+        this.snapshotWorkerLogs(deadW);
+      }
       this.workers.delete(deadId);
       this.sessionRegistry.removeWorkerSessions(deadId);
       this.ensureMinWorkers();
@@ -413,8 +497,10 @@ export class WorkerPool {
       await worker.start();
       return worker;
     } catch (err) {
+      this.snapshotWorkerLogs(worker);
       this.workers.delete(id);
       worker.destroy();
+      this.snapshotWorkerLogs(worker);
       throw err;
     }
   }
@@ -439,10 +525,44 @@ export class WorkerPool {
     });
   }
 
+  private snapshotWorkerLogs(worker: AcpWorker): void {
+    const lines = worker.snapshotLiveLogs();
+    if (lines.length === 0) return;
+    if (this.exitedWorkerLogs.has(worker.id)) {
+      this.exitedWorkerLogs.delete(worker.id);
+    }
+    this.exitedWorkerLogs.set(worker.id, {
+      workerId: worker.id,
+      closedAt: Date.now(),
+      lastSeq: worker.getLastLogSeq(),
+      lines,
+    });
+    while (this.exitedWorkerLogs.size > MAX_EXITED_WORKER_LOG_SNAPSHOTS) {
+      const oldestKey = this.exitedWorkerLogs.keys().next().value;
+      if (!oldestKey) break;
+      this.exitedWorkerLogs.delete(oldestKey);
+    }
+  }
+
+  private pruneExitedWorkerLogs(retentionMs: number): void {
+    if (retentionMs <= 0) {
+      this.exitedWorkerLogs.clear();
+      return;
+    }
+    const cutoff = Date.now() - retentionMs;
+    for (const [wId, snap] of this.exitedWorkerLogs.entries()) {
+      if (snap.closedAt <= cutoff) {
+        this.exitedWorkerLogs.delete(wId);
+      }
+    }
+  }
+
   private reapIdleBurstWorkers(): void {
     this.sessionRegistry.pruneExpired((wId, sId) => {
       this.workers.get(wId)?.closeSession(sId).catch(() => {});
     });
+    debugStore.pruneExpired(config.logRetentionMs);
+    this.pruneExitedWorkerLogs(config.logRetentionMs);
 
     if (this.workers.size <= config.minWorkers) return;
 
@@ -457,6 +577,7 @@ export class WorkerPool {
         this.workers.delete(id);
         this.sessionRegistry.removeWorkerSessions(id);
         worker.destroy();
+        this.snapshotWorkerLogs(worker);
       }
     }
   }
