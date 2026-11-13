@@ -6,7 +6,7 @@
       "name": "agy-acp2api",
       "description": "Bridges the local Antigravity ACP Gateway (agy-acp2api) and embeds its Material Design 3 web console into CLIProxyAPI.",
       "author": "chengdidididi",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "repository": "https://github.com/chengdidididi/agy-acp2api",
       "homepage": "https://github.com/chengdidididi/agy-acp2api",
       "license": "MIT",
@@ -26,37 +26,37 @@
           {
             "goos": "darwin",
             "goarch": "amd64",
-            "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.1_darwin_amd64.zip",
-            "sha256": "6e66a09d4f2a6ee4d5cbbbbaf6a738ad333d09e16d1ebf1ecb13db579f32892a",
+            "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.2_darwin_amd64.zip",
+            "sha256": "ae945492cbf95b216308174d973329176f8bc5d637e8120b14e7f17903866b01",
             "size": 2660205
           },
           {
             "goos": "darwin",
             "goarch": "arm64",
-            "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.1_darwin_arm64.zip",
-            "sha256": "508ada2e408ecbea18ba23dfc2a6c6fcbe35827e3c0fa1670777603b32d02a12",
-            "size": 2496289
+            "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.2_darwin_arm64.zip",
+            "sha256": "6937c298418dda4d70e4e675060747df5fe63d5a98fcb5823fce23a42c6a1de5",
+            "size": 2496296
           },
           {
             "goos": "linux",
             "goarch": "amd64",
-            "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.1_linux_amd64.zip",
-            "sha256": "3c49a61e6dca5b773e696e074cb499601166acbaeff946d2d9d9dd793d37c588",
-            "size": 2792272
+            "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.2_linux_amd64.zip",
+            "sha256": "a050f58042ad8d9ee57d923be4f7350c2d7c49339097e5ff2006b7f57763f435",
+            "size": 2792290
           },
           {
             "goos": "linux",
             "goarch": "arm64",
-            "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.1_linux_arm64.zip",
-            "sha256": "ba262b05fbbde8f0126d9f8bc06e7534ace6aae7e223fc8053ae7617d987dd97",
-            "size": 2578351
+            "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.2_linux_arm64.zip",
+            "sha256": "870fb8426fdf61c765d30b815f255b92d3cacbcf20ee50a8590c391c40913ced",
+            "size": 2578349
           },
           {
             "goos": "windows",
             "goarch": "amd64",
-            "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.1_windows_amd64.zip",
-            "sha256": "2c6432aa845d1d7fcf02c2b3d3eac4f0ea2b3dbebaf5b03594ffb425da115b11",
-            "size": 2723774
+            "url": "https://raw.githubusercontent.com/chengdidididi/agy-acp2api/main/cpa-plugin/releases/agy-acp2api_0.1.2_windows_amd64.zip",
+            "sha256": "f64133f37669588fcbaaccd841eb30c584bfceac719fc1833eda47726c43fe14",
+            "size": 2723775
           }
         ]
       }
