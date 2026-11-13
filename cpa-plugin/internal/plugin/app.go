@@ -701,8 +701,8 @@ func (a *App) handleExecuteStream(raw []byte) ([]byte, error) {
 	reader := bufio.NewReader(resp.Body)
 	for {
 		line, errRead := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			chunks = append(chunks, ExecutorStreamChunk{Payload: append([]byte(nil), line...)})
+		if payload := extractSSEDataPayload(line); len(payload) > 0 {
+			chunks = append(chunks, ExecutorStreamChunk{Payload: payload})
 		}
 		if errRead != nil {
 			if errors.Is(errRead, io.EOF) {
@@ -729,13 +729,13 @@ func (a *App) pumpStreamToHost(streamID string, body io.ReadCloser, hostCall Hos
 		_, _ = hostCall(MethodHostStreamClose, closePayload)
 	}()
 
-	buf := make([]byte, 4096)
+	reader := bufio.NewReader(body)
 	for {
-		n, err := body.Read(buf)
-		if n > 0 {
+		line, err := reader.ReadBytes('\n')
+		if payload := extractSSEDataPayload(line); len(payload) > 0 {
 			emitPayload, _ := json.Marshal(HostStreamEmitRequest{
 				StreamID: streamID,
-				Payload:  append([]byte(nil), buf[:n]...),
+				Payload:  payload,
 			})
 			if _, errEmit := hostCall(MethodHostStreamEmit, emitPayload); errEmit != nil {
 				errMsg = errEmit.Error()
@@ -749,6 +749,22 @@ func (a *App) pumpStreamToHost(streamID string, body io.ReadCloser, hostCall Hos
 			return
 		}
 	}
+}
+
+func extractSSEDataPayload(line []byte) []byte {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 || trimmed[0] == ':' {
+		return nil
+	}
+	if bytes.HasPrefix(trimmed, []byte("data:")) {
+		trimmed = bytes.TrimSpace(trimmed[5:])
+	} else if trimmed[0] != '{' && trimmed[0] != '[' {
+		return nil
+	}
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("[DONE]")) {
+		return nil
+	}
+	return append([]byte(nil), trimmed...)
 }
 
 func restoreThinkingFields(payload, original []byte) []byte {

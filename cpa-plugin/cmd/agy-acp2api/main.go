@@ -62,7 +62,7 @@ import (
 	"github.com/agy-acp2api/cpa-plugin-agy2api/internal/plugin"
 )
 
-var pluginVersion = "0.1.2"
+var pluginVersion = "0.1.3"
 
 var app = plugin.NewApp()
 
