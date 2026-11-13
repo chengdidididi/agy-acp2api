@@ -47,6 +47,8 @@ type App struct {
 	hostCall     HostCallbackFunc
 	sidecarCmd   *exec.Cmd
 	cachedModels map[string]bool
+	syncedAPIKey string
+	lastSyncAt   time.Time
 }
 
 func NewApp() *App {
@@ -127,6 +129,8 @@ func (a *App) configure(raw []byte) error {
 
 	a.mu.Lock()
 	a.cfg = cfg
+	a.syncedAPIKey = ""
+	a.lastSyncAt = time.Time{}
 	if req.PluginDir != "" {
 		a.pluginDir = req.PluginDir
 	}
@@ -236,8 +240,8 @@ func (a *App) registration() Registration {
 			ModelRouter:           true,
 			Executor:              true,
 			ExecutorModelScope:    "both",
-			ExecutorInputFormats:  []string{"chat-completions", "openai"},
-			ExecutorOutputFormats: []string{"chat-completions", "openai"},
+			ExecutorInputFormats:  []string{"openai", "chat-completions"},
+			ExecutorOutputFormats: []string{"openai", "chat-completions"},
 			ManagementAPI:         true,
 		},
 	}
@@ -383,6 +387,13 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		}
 	}
 
+	if targetPath == "/api/admin/config" && resp.StatusCode == http.StatusOK {
+		a.mu.Lock()
+		a.syncedAPIKey = ""
+		a.lastSyncAt = time.Time{}
+		a.mu.Unlock()
+	}
+
 	return OKEnvelope(ManagementResponse{
 		StatusCode: resp.StatusCode,
 		Headers:    outHeaders,
@@ -436,40 +447,64 @@ func (a *App) offlineResponse(targetPath, upstream string, err error) Management
 func (a *App) handleModels() ([]byte, error) {
 	a.mu.RLock()
 	upstream := a.cfg.UpstreamURL
-	apiKey := a.cfg.APIKey
+	apiKey := a.syncedAPIKey
+	if apiKey == "" {
+		apiKey = a.cfg.APIKey
+	}
 	a.mu.RUnlock()
 
-	req, err := http.NewRequest(http.MethodGet, upstream+"/v1/models", nil)
-	if err != nil {
-		return OKEnvelope(ModelResponse{Provider: PluginID, Models: []ModelInfo{}})
+	type rawModel struct {
+		ID          string `json:"id"`
+		Created     int64  `json:"created"`
+		Description string `json:"description"`
+		Name        string `json:"name"`
 	}
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+	var items []rawModel
+	var syncedKey string
+
+	if resp, err := a.client.Get(upstream + "/api/admin/overview"); err == nil {
+		var ov struct {
+			Config *struct {
+				APIKey string `json:"apiKey"`
+			} `json:"config"`
+			UnifiedModels []rawModel `json:"unifiedModels"`
+		}
+		if resp.StatusCode == http.StatusOK && json.NewDecoder(resp.Body).Decode(&ov) == nil {
+			if ov.Config != nil && strings.TrimSpace(ov.Config.APIKey) != "" {
+				syncedKey = strings.TrimSpace(ov.Config.APIKey)
+				apiKey = syncedKey
+			}
+			items = ov.UnifiedModels
+		}
+		_ = resp.Body.Close()
 	}
 
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return OKEnvelope(ModelResponse{Provider: PluginID, Models: []ModelInfo{}})
+	if len(items) == 0 {
+		if req, err := http.NewRequest(http.MethodGet, upstream+"/v1/models", nil); err == nil {
+			if apiKey != "" {
+				req.Header.Set("Authorization", "Bearer "+apiKey)
+			}
+			if resp, err := a.client.Do(req); err == nil {
+				var listResp struct {
+					Data []rawModel `json:"data"`
+				}
+				if resp.StatusCode == http.StatusOK && json.NewDecoder(resp.Body).Decode(&listResp) == nil {
+					items = listResp.Data
+				}
+				_ = resp.Body.Close()
+			}
+		}
 	}
-	defer resp.Body.Close()
 
-	var listResp struct {
-		Data []struct {
-			ID          string `json:"id"`
-			Created     int64  `json:"created"`
-			OwnedBy     string `json:"owned_by"`
-			Description string `json:"description"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
-		return OKEnvelope(ModelResponse{Provider: PluginID, Models: []ModelInfo{}})
-	}
-
-	models := make([]ModelInfo, 0, len(listResp.Data))
-	newCache := make(map[string]bool, len(listResp.Data))
-	for _, m := range listResp.Data {
+	models := make([]ModelInfo, 0, len(items))
+	newCache := make(map[string]bool, len(items))
+	for _, m := range items {
 		if m.ID == "" {
 			continue
+		}
+		desc := m.Description
+		if desc == "" {
+			desc = m.Name
 		}
 		newCache[m.ID] = true
 		for _, lv := range []string{"low", "medium", "high", "xhigh"} {
@@ -482,16 +517,22 @@ func (a *App) handleModels() ([]byte, error) {
 			Object:                     "model",
 			Created:                    m.Created,
 			OwnedBy:                    PluginID,
-			DisplayName:                m.Description,
+			DisplayName:                desc,
 			Name:                       m.ID,
-			Description:                m.Description,
+			Description:                desc,
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
 		})
 	}
 
 	a.mu.Lock()
-	a.cachedModels = newCache
+	if syncedKey != "" {
+		a.syncedAPIKey = syncedKey
+	}
+	if len(newCache) > 0 {
+		a.cachedModels = newCache
+	}
+	a.lastSyncAt = time.Now()
 	a.mu.Unlock()
 
 	return OKEnvelope(ModelResponse{
@@ -513,6 +554,7 @@ func (a *App) handleModelRoute(raw []byte) ([]byte, error) {
 	a.mu.RLock()
 	enabled := a.cfg.Enabled
 	known := a.cachedModels[model]
+	lastSync := a.lastSyncAt
 	a.mu.RUnlock()
 
 	if !enabled {
@@ -528,6 +570,13 @@ func (a *App) handleModelRoute(raw []byte) ([]byte, error) {
 			TargetModel: targetModel,
 			Reason:      "routed via agy/ prefix to local agy-acp2api",
 		})
+	}
+
+	if !known && time.Since(lastSync) > 2*time.Second {
+		_, _ = a.handleModels()
+		a.mu.RLock()
+		known = a.cachedModels[model]
+		a.mu.RUnlock()
 	}
 
 	if known {
@@ -549,14 +598,14 @@ func (a *App) handleExecute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	payload := req.Payload
-	if len(payload) == 0 {
-		payload = req.OriginalRequest
-	}
+	payload := restoreThinkingFields(req.Payload, req.OriginalRequest)
 
 	a.mu.RLock()
 	upstream := a.cfg.UpstreamURL
-	apiKey := a.cfg.APIKey
+	apiKey := a.syncedAPIKey
+	if apiKey == "" {
+		apiKey = a.cfg.APIKey
+	}
 	a.mu.RUnlock()
 
 	httpReq, err := http.NewRequest(http.MethodPost, upstream+"/v1/chat/completions", bytes.NewReader(payload))
@@ -601,14 +650,14 @@ func (a *App) handleExecuteStream(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	payload := req.Payload
-	if len(payload) == 0 {
-		payload = req.OriginalRequest
-	}
+	payload := restoreThinkingFields(req.Payload, req.OriginalRequest)
 
 	a.mu.RLock()
 	upstream := a.cfg.UpstreamURL
-	apiKey := a.cfg.APIKey
+	apiKey := a.syncedAPIKey
+	if apiKey == "" {
+		apiKey = a.cfg.APIKey
+	}
 	hostCall := a.hostCall
 	a.mu.RUnlock()
 
@@ -700,4 +749,35 @@ func (a *App) pumpStreamToHost(streamID string, body io.ReadCloser, hostCall Hos
 			return
 		}
 	}
+}
+
+func restoreThinkingFields(payload, original []byte) []byte {
+	if len(payload) == 0 {
+		return original
+	}
+	if len(original) == 0 || bytes.Equal(payload, original) {
+		return payload
+	}
+	var orig, doc map[string]json.RawMessage
+	if json.Unmarshal(original, &orig) != nil || json.Unmarshal(payload, &doc) != nil || doc == nil {
+		return payload
+	}
+	changed := false
+	for _, k := range []string{"reasoning_effort", "thinking", "reasoning"} {
+		v := bytes.TrimSpace(orig[k])
+		if len(v) > 0 && !bytes.Equal(v, []byte("null")) && !bytes.Equal(bytes.TrimSpace(doc[k]), v) {
+			doc[k] = append(json.RawMessage(nil), v...)
+			changed = true
+		}
+	}
+	if changed && len(bytes.TrimSpace(orig["reasoning_effort"])) == 0 {
+		delete(doc, "reasoning_effort")
+	}
+	if !changed {
+		return payload
+	}
+	if out, err := json.Marshal(doc); err == nil {
+		return out
+	}
+	return payload
 }

@@ -14,7 +14,7 @@ permissions:
 
 env:
   PLUGIN_ID: agy-acp2api
-  DEFAULT_TAG: v0.1.0
+  DEFAULT_TAG: v0.1.1
 
 jobs:
   build:
@@ -143,6 +143,7 @@ jobs:
 
           # 1. Copy built zip files into cpa-plugin/releases/ and generate schema_version 2 registry.json
           mkdir -p cpa-plugin/releases
+          rm -f cpa-plugin/releases/*.zip
           cp dist/*.zip dist/checksums.txt cpa-plugin/releases/
 
           RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/cpa-plugin/releases"
