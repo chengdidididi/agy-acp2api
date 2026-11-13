@@ -137,13 +137,13 @@ npm run start:prod
 
 ### 模型与思考强度（Reasoning Effort）调用方式
 
-网关支持 `/v1/models` 自动枚举当前 `agy` 账号支持的所有模型，并提供了三种灵活的方式控制思考强度（`low` / `medium` / `high`）：
+网关支持 `/v1/models` 自动枚举当前 `agy` 账号支持的所有模型，并提供了灵活的方式控制思考强度（`low` / `medium` / `high` / `xhigh`，其中 `gemini-4-hydrogen` 原生支持 `xhigh` 档位，其余模型传入 `xhigh` 时会自动平滑降级至 `high`）：
 
-1. **标准参数**：使用基础模型名（如 `gemini-4-carbon`、`gemini-4-argon`、`gemini-3.8-flash`、`claude-sonnet-5-5`），并在请求体中传入 OpenAI 标准字段 `reasoning_effort: "low" | "medium" | "high"`。
+1. **标准参数**：使用基础模型名（如 `gemini-4-hydrogen`、`gemini-4-carbon`、`gemini-4-argon`、`gemini-3.8-flash`、`claude-sonnet-5-5`），并在请求体中传入 OpenAI 标准字段 `reasoning_effort: "low" | "medium" | "high" | "xhigh"`。
 2. **模型名后缀**：直接在客户端模型名中追加后缀，网关会自动解析并映射：
-   * 连字符写法：`gemini-4-carbon-high`、`gemini-4-argon-high`、`gemini-3.8-flash-low`
-   * 括号写法：`gemini-4-carbon(high)`、`gemini-4-argon (low)`
-   * 冒号写法：`gemini-4-carbon:high`、`gemini-4-argon:high`
+   * 连字符写法：`gemini-4-hydrogen-xhigh`、`gemini-4-carbon-high`、`gemini-4-argon-high`、`gemini-3.8-flash-low`
+   * 括号写法：`gemini-4-hydrogen(xhigh)`、`gemini-4-carbon(high)`、`gemini-4-argon (low)`
+   * 冒号写法：`gemini-4-hydrogen:xhigh`、`gemini-4-carbon:high`、`gemini-4-argon:high`
 
 ### 环境变量与配置文件参考
 
@@ -156,7 +156,7 @@ npm run start:prod
 | `AGY2API_KEY` | `sk-agy2api-local-key` | Bearer 鉴权密钥 |
 | `AGY_BIN` | `agy` | `agy` 可执行文件路径 |
 | `AGY_DEFAULT_MODEL` | `gemini-3.8-flash` | 未指定或模型不存在时的回退默认模型 |
-| `AGY_DEFAULT_THINKING_LEVEL` | `medium` | 默认思考强度 (`low` / `medium` / `high`) |
+| `AGY_DEFAULT_THINKING_LEVEL` | `medium` | 默认思考强度 (`low` / `medium` / `high` / `xhigh`) |
 | `AGY_MIN_WORKERS` | `1` | 常驻热进程池最小 Worker 数量 |
 | `AGY_MAX_WORKERS` | `2` | 最大并发 Worker 数量（建议保持 $\le 2$ 以防上游并发风控） |
 

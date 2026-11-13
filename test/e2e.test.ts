@@ -89,6 +89,10 @@ function testUnifiedModelAndEffortResolverUnit() {
     { modelId: "gemini-4-argon-low", name: "Gemini 4 Argon (Low)" },
     { modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)" },
     { modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (High)" },
+    { modelId: "gemini-4-hydrogen-low", name: "Gemini 4 Hydrogen (Low)" },
+    { modelId: "gemini-4-hydrogen-medium", name: "Gemini 4 Hydrogen (Medium)" },
+    { modelId: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (High)" },
+    { modelId: "gemini-4-hydrogen-xhigh", name: "Gemini 4 Hydrogen (XHigh)" },
     { modelId: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" },
     { modelId: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
     { modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
@@ -96,11 +100,14 @@ function testUnifiedModelAndEffortResolverUnit() {
   ];
 
   const catalog = buildUnifiedModelCatalog(sampleRaw);
-  assert.equal(catalog.length, 4);
+  assert.equal(catalog.length, 5);
   const carbon = catalog.find((c) => c.id === "gemini-4-carbon")!;
   assert.deepEqual(carbon.thinkingLevels, ["low", "medium", "high"]);
   const argon = catalog.find((c) => c.id === "gemini-4-argon")!;
   assert.deepEqual(argon.thinkingLevels, ["low", "medium", "high"]);
+  const hydrogen = catalog.find((c) => c.id === "gemini-4-hydrogen")!;
+  assert.equal(hydrogen.name, "Gemini 4 Hydrogen");
+  assert.deepEqual(hydrogen.thinkingLevels, ["low", "medium", "high", "xhigh"]);
 
   // Test 1: Base model + reasoning_effort (Carbon & Argon)
   const rc1 = resolveModelAndThinking(
@@ -156,7 +163,52 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(r3.thinkingLevel, "high");
   assert.equal(r3.acpModelId, "gemini-4-argon-high");
 
+  // Test 3b: Gemini 4 Hydrogen supports all 4 effort levels (`low`, `medium`, `high`, `xhigh`),
+  // while `xhigh` on 3-level models gracefully clamps to `high`
+  const rh1 = resolveModelAndThinking(
+    { model: "gemini-4-hydrogen", reasoning_effort: "xhigh", messages: [] },
+    sampleRaw
+  );
+  assert.equal(rh1.baseModelId, "gemini-4-hydrogen");
+  assert.equal(rh1.thinkingLevel, "xhigh");
+  assert.equal(rh1.acpModelId, "gemini-4-hydrogen-xhigh");
+
+  const rh2 = resolveModelAndThinking(
+    { model: "gemini-4-hydrogen-xhigh", messages: [] },
+    sampleRaw
+  );
+  assert.equal(rh2.baseModelId, "gemini-4-hydrogen");
+  assert.equal(rh2.thinkingLevel, "xhigh");
+  assert.equal(rh2.acpModelId, "gemini-4-hydrogen-xhigh");
+
+  const rh3 = resolveModelAndThinking(
+    { model: "gemini-4-hydrogen(high)", messages: [] },
+    sampleRaw
+  );
+  assert.equal(rh3.baseModelId, "gemini-4-hydrogen");
+  assert.equal(rh3.thinkingLevel, "high");
+  assert.equal(rh3.acpModelId, "gemini-4-hydrogen-high");
+
+  const rh4 = resolveModelAndThinking(
+    { model: "gemini-4-hydrogen:low", messages: [] },
+    sampleRaw
+  );
+  assert.equal(rh4.baseModelId, "gemini-4-hydrogen");
+  assert.equal(rh4.thinkingLevel, "low");
+  assert.equal(rh4.acpModelId, "gemini-4-hydrogen-low");
+
+  const rcClamp = resolveModelAndThinking(
+    { model: "gemini-4-carbon", reasoning_effort: "xhigh", messages: [] },
+    sampleRaw
+  );
+  assert.equal(rcClamp.baseModelId, "gemini-4-carbon");
+  assert.equal(rcClamp.thinkingLevel, "high");
+  assert.equal(rcClamp.acpModelId, "gemini-4-carbon-high");
+
   // Test 4: Suffix stripping for API client responses
+  assert.equal(stripModelThinkingSuffix("gemini-4-hydrogen-xhigh"), "gemini-4-hydrogen");
+  assert.equal(stripModelThinkingSuffix("gemini-4-hydrogen (xhigh)"), "gemini-4-hydrogen");
+  assert.equal(stripModelThinkingSuffix("gemini-4-hydrogen:high"), "gemini-4-hydrogen");
   assert.equal(stripModelThinkingSuffix("gemini-4-carbon-high"), "gemini-4-carbon");
   assert.equal(stripModelThinkingSuffix("gemini-4-carbon (high)"), "gemini-4-carbon");
   assert.equal(stripModelThinkingSuffix("gemini-3.8-flash-low"), "gemini-3.8-flash");
@@ -707,6 +759,9 @@ async function runIntegrationTest() {
       modelsJson.data.map((d) => `${d.id} [${d.thinking_levels.join(",")}]`)
     );
     assert.ok(modelsJson.data.some((d) => d.id === "gemini-4-carbon"));
+    const hydrogenModelEntry = modelsJson.data.find((d) => d.id === "gemini-4-hydrogen");
+    assert.ok(hydrogenModelEntry, "Expected gemini-4-hydrogen in /v1/models");
+    assert.deepEqual(hydrogenModelEntry!.thinking_levels, ["low", "medium", "high", "xhigh"]);
     assert.ok(modelsJson.data.some((d) => d.id === "gemini-3.8-flash"));
 
     const tools: OpenAIToolDefinition[] = [
@@ -1175,6 +1230,89 @@ async function runIntegrationTest() {
     const imgTurn2Text = String(imgTurn2Json.choices[0].message.content || "");
     console.log("   -> Image Turn 2 (Cache HIT) Reply:", JSON.stringify(imgTurn2Text));
     assert.ok(imgTurn2Text.toLowerCase().includes("red"));
+
+    console.log(
+      "\n11. [E2E Turn 6 — Gemini 4 Hydrogen (`low` -> `xhigh` Effort Switch & Session Reuse)]..."
+    );
+    const hydrogenTurn1Messages: OpenAIMessage[] = [
+      {
+        role: "user",
+        content:
+          "Remember code HYDROGEN-42 and reply with ONLY the exact word READY.",
+      },
+    ];
+    const resHyd1 = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-4-hydrogen(low)",
+        messages: hydrogenTurn1Messages,
+        stream: false,
+      }),
+    });
+    assert.equal(resHyd1.status, 200);
+    assert.equal(resHyd1.headers.get("X-Agy2Api-Resolved-Model"), "gemini-4-hydrogen");
+    assert.equal(resHyd1.headers.get("X-Agy2Api-Thinking-Level"), "low");
+    const hydSessionId = resHyd1.headers.get("X-Agy2Api-Session-Id");
+    const hyd1Json = (await resHyd1.json()) as any;
+    console.log("   -> Hydrogen Turn 1 (low) Model:", hyd1Json.model, "Reply:", JSON.stringify(hyd1Json.choices[0].message.content));
+    assert.equal(hyd1Json.model, "gemini-4-hydrogen");
+
+    const resHyd2 = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-4-hydrogen",
+        reasoning_effort: "xhigh",
+        messages: [
+          ...hydrogenTurn1Messages,
+          {
+            role: "assistant",
+            content: String(hyd1Json.choices[0].message.content || ""),
+          },
+          {
+            role: "user",
+            content: "What exact code did I ask you to remember? Reply with ONLY that code.",
+          },
+        ],
+        stream: true,
+      }),
+    });
+    assert.equal(resHyd2.status, 200);
+    assert.equal(resHyd2.headers.get("X-Agy2Api-Session-Cache"), "HIT");
+    assert.equal(resHyd2.headers.get("X-Agy2Api-Session-Id"), hydSessionId);
+    assert.equal(resHyd2.headers.get("X-Agy2Api-Resolved-Model"), "gemini-4-hydrogen");
+    assert.equal(resHyd2.headers.get("X-Agy2Api-Thinking-Level"), "xhigh");
+    const hydTurn2 = await consumeSseStream(resHyd2);
+    console.log(
+      "   -> Hydrogen Turn 2 (xhigh, Cache HIT) Model:",
+      hydTurn2.lastModel,
+      "Reply:",
+      JSON.stringify(hydTurn2.content)
+    );
+    assert.equal(hydTurn2.lastModel, "gemini-4-hydrogen");
+    assert.ok(hydTurn2.content.includes("HYDROGEN-42"));
+
+    // Verify live /v1/models synced from `agy acp` still unifies `gemini-4-hydrogen` cleanly without leaking `-xhigh`
+    const modelsAfterHydRes = await fetch(`${baseUrl}/v1/models`, {
+      headers: { Authorization: `Bearer ${config.apiKey}` },
+    });
+    const modelsAfterHydJson = (await modelsAfterHydRes.json()) as {
+      data: Array<{ id: string; thinking_levels: string[] }>;
+    };
+    const liveHyd = modelsAfterHydJson.data.find((d) => d.id === "gemini-4-hydrogen");
+    assert.ok(liveHyd, "Expected gemini-4-hydrogen in live /v1/models");
+    assert.deepEqual(liveHyd!.thinking_levels, ["low", "medium", "high", "xhigh"]);
+    assert.ok(
+      !modelsAfterHydJson.data.some((d) => d.id === "gemini-4-hydrogen-xhigh"),
+      "Expected gemini-4-hydrogen-xhigh to be unified under gemini-4-hydrogen"
+    );
 
     console.log("\nALL UNIT & E2E TESTS PASSED SUCCESSFULLY!");
   } finally {

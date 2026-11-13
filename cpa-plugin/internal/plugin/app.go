@@ -472,8 +472,10 @@ func (a *App) handleModels() ([]byte, error) {
 			continue
 		}
 		newCache[m.ID] = true
-		for _, lv := range []string{"low", "medium", "high"} {
+		for _, lv := range []string{"low", "medium", "high", "xhigh"} {
 			newCache[m.ID+"-"+lv] = true
+			newCache[m.ID+"("+lv+")"] = true
+			newCache[m.ID+":"+lv] = true
 		}
 		models = append(models, ModelInfo{
 			ID:                         m.ID,

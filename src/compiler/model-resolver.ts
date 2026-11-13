@@ -17,19 +17,19 @@ export interface ResolvedModelTarget {
   acpModelId: string;
 }
 
-const LEVEL_ORDER: ThinkingLevel[] = ["low", "medium", "high"];
+const LEVEL_ORDER: ThinkingLevel[] = ["low", "medium", "high", "xhigh"];
 
 /**
- * Strips any thinking level suffix (`-low`, `-medium`, `-high`, `(low)`, `:high`, etc.)
+ * Strips any thinking level suffix (`-low`, `-medium`, `-high`, `-xhigh`, `(low)`, `:high`, etc.)
  * so model names returned to API clients are always clean base model identifiers.
  */
 export function stripModelThinkingSuffix(rawModel: string): string {
   if (!rawModel) return rawModel;
   return rawModel
     .trim()
-    .replace(/\s*[([]\s*(?:low|medium|high|minimal|max|xhigh)\s*[)\]]\s*$/i, "")
-    .replace(/[:@/]\s*(?:low|medium|high|minimal|max|xhigh)\s*$/i, "")
-    .replace(/-(?:low|medium|high)$/i, "")
+    .replace(/\s*[([]\s*(?:low|medium|high|minimal|max|xhigh|extra[\s_-]*high)\s*[)\]]\s*$/i, "")
+    .replace(/[:@/]\s*(?:low|medium|high|minimal|max|xhigh|extra[\s_-]*high)\s*$/i, "")
+    .replace(/-(?:low|medium|high|xhigh)$/i, "")
     .trim();
 }
 
@@ -38,13 +38,22 @@ export function normalizeThinkingLevel(raw?: string | null): ThinkingLevel | nul
   const v = raw.trim().toLowerCase();
   if (v === "low" || v === "minimal" || v === "min") return "low";
   if (v === "medium" || v === "med" || v === "normal" || v === "auto") return "medium";
-  if (v === "high" || v === "xhigh" || v === "max" || v === "deep") return "high";
+  if (
+    v === "xhigh" ||
+    v === "extra_high" ||
+    v === "extra-high" ||
+    v === "extra high" ||
+    v === "max"
+  ) {
+    return "xhigh";
+  }
+  if (v === "high" || v === "deep") return "high";
   return null;
 }
 
 /**
- * Aggregates raw ACP model entries (e.g. `gemini-4-argon-low/medium/high`)
- * into unified base models (`gemini-4-argon` with `thinkingLevels: ["low", "medium", "high"]`).
+ * Aggregates raw ACP model entries (e.g. `gemini-4-hydrogen-low/medium/high/xhigh`)
+ * into unified base models (`gemini-4-hydrogen` with `thinkingLevels: ["low", "medium", "high", "xhigh"]`).
  */
 export function buildUnifiedModelCatalog(
   rawModels: AcpModelInfo[]
@@ -52,11 +61,13 @@ export function buildUnifiedModelCatalog(
   const map = new Map<string, UnifiedModelCatalogItem>();
 
   for (const m of rawModels) {
-    const match = m.modelId.match(/^(.*)-(low|medium|high)$/i);
+    const match = m.modelId.match(/^(.*)-(low|medium|high|xhigh)$/i);
     if (match) {
       const baseId = match[1];
       const level = match[2].toLowerCase() as ThinkingLevel;
-      const cleanName = m.name.replace(/\s*\((Low|Medium|High)\)\s*$/i, "").trim();
+      const cleanName = m.name
+        .replace(/\s*\((Low|Medium|High|XHigh)\)\s*$/i, "")
+        .trim();
 
       let item = map.get(baseId);
       if (!item) {
@@ -75,7 +86,7 @@ export function buildUnifiedModelCatalog(
       }
       item.variants[level] = m.modelId;
     } else {
-      // Model without -low/-medium/-high suffix
+      // Model without -low/-medium/-high/-xhigh suffix
       if (!map.has(m.modelId)) {
         map.set(m.modelId, {
           id: m.modelId,
@@ -90,16 +101,18 @@ export function buildUnifiedModelCatalog(
     }
   }
 
-  // Sort thinkingLevels consistently: low -> medium -> high
+  // Sort thinkingLevels consistently: low -> medium -> high -> xhigh
   for (const item of map.values()) {
     item.thinkingLevels.sort(
       (a, b) => LEVEL_ORDER.indexOf(a) - LEVEL_ORDER.indexOf(b)
     );
     if (!item.thinkingLevels.includes(item.defaultThinkingLevel)) {
       item.defaultThinkingLevel =
-        item.thinkingLevels.includes("medium")
-          ? "medium"
-          : item.thinkingLevels[0] || "medium";
+        item.defaultThinkingLevel === "xhigh" && item.thinkingLevels.includes("high")
+          ? "high"
+          : item.thinkingLevels.includes("medium")
+            ? "medium"
+            : item.thinkingLevels[0] || "medium";
     }
   }
 
@@ -120,16 +133,16 @@ export function resolveModelAndThinking(
   let candidateBase = rawModelStr;
   let suffixLevel: ThinkingLevel | null = null;
 
-  // 1. Check bracket/colon/at/slash syntax: e.g. `gemini-4-argon(high)`, `gemini-4-argon:low`, `gemini-4-argon@high`
+  // 1. Check bracket/colon/at/slash syntax: e.g. `gemini-4-hydrogen(xhigh)`, `gemini-4-argon:low`, `gemini-4-argon@high`
   const symbolMatch = candidateBase.match(
-    /^(.*?)(?:[:@/(\[]\s*(low|medium|high|minimal|max|xhigh)\s*[)\]]?)$/i
+    /^(.*?)(?:[:@/(\[]\s*(low|medium|high|minimal|max|xhigh|extra[\s_-]*high)\s*[)\]]?)$/i
   );
   if (symbolMatch) {
     candidateBase = symbolMatch[1].trim();
     suffixLevel = normalizeThinkingLevel(symbolMatch[2]);
   } else {
-    // 2. Check hyphen suffix syntax: e.g. `gemini-4-argon-high`
-    const hyphenMatch = candidateBase.match(/^(.*)-(low|medium|high)$/i);
+    // 2. Check hyphen suffix syntax: e.g. `gemini-4-hydrogen-xhigh`, `gemini-4-argon-high`
+    const hyphenMatch = candidateBase.match(/^(.*)-(low|medium|high|xhigh)$/i);
     if (hyphenMatch) {
       candidateBase = hyphenMatch[1].trim();
       suffixLevel = normalizeThinkingLevel(hyphenMatch[2]);
@@ -146,7 +159,8 @@ export function resolveModelAndThinking(
     } else if (typeof req.thinking.budget_tokens === "number") {
       if (req.thinking.budget_tokens <= 4096) bodyLevel = "low";
       else if (req.thinking.budget_tokens <= 16384) bodyLevel = "medium";
-      else bodyLevel = "high";
+      else if (req.thinking.budget_tokens <= 24576) bodyLevel = "high";
+      else bodyLevel = "xhigh";
     }
   } else if (req.reasoning) {
     if (req.reasoning.effort || req.reasoning.level) {
@@ -154,7 +168,8 @@ export function resolveModelAndThinking(
     } else if (typeof req.reasoning.max_tokens === "number") {
       if (req.reasoning.max_tokens <= 4096) bodyLevel = "low";
       else if (req.reasoning.max_tokens <= 16384) bodyLevel = "medium";
-      else bodyLevel = "high";
+      else if (req.reasoning.max_tokens <= 24576) bodyLevel = "high";
+      else bodyLevel = "xhigh";
     }
   }
 
@@ -168,9 +183,11 @@ export function resolveModelAndThinking(
     catalog.find((c) => c.id.toLowerCase() === rawModelStr.toLowerCase());
 
   if (catalogEntry) {
-    const effectiveLevel = catalogEntry.variants[desiredLevel]
+    const effectiveLevel: ThinkingLevel = catalogEntry.variants[desiredLevel]
       ? desiredLevel
-      : catalogEntry.defaultThinkingLevel;
+      : desiredLevel === "xhigh" && catalogEntry.variants.high
+        ? "high"
+        : catalogEntry.defaultThinkingLevel;
     const acpModelId =
       catalogEntry.variants[effectiveLevel] ||
       Object.values(catalogEntry.variants)[0] ||
@@ -185,7 +202,7 @@ export function resolveModelAndThinking(
   }
 
   // Fallback if custom/unlisted model ID is passed
-  const fallbackAcpId = rawModelStr.match(/-(low|medium|high)$/i)
+  const fallbackAcpId = rawModelStr.match(/-(low|medium|high|xhigh)$/i)
     ? rawModelStr
     : `${candidateBase}-${desiredLevel}`;
 

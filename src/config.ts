@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-export type ThinkingLevel = "low" | "medium" | "high";
+export type ThinkingLevel = "low" | "medium" | "high" | "xhigh";
 export type UiLayout = "side" | "top";
 
 export interface GatewayConfig {
@@ -78,7 +78,7 @@ export function updateGatewayConfig(
   }
   if (
     patch.defaultThinkingLevel &&
-    ["low", "medium", "high"].includes(patch.defaultThinkingLevel)
+    ["low", "medium", "high", "xhigh"].includes(patch.defaultThinkingLevel)
   ) {
     config.defaultThinkingLevel = patch.defaultThinkingLevel;
   }

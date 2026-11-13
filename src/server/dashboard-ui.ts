@@ -162,7 +162,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   .seg button + button { box-shadow:inset 1px 0 0 var(--outline); }
   .seg button.on { background:var(--secondary-container); color:var(--on-secondary-container); }
   .seg button.on .ms { font-variation-settings:"FILL" 1,"wght" 400,"GRAD" 0,"opsz" 24; }
-  .seg.full { display:flex; } .seg.full button { flex:1; }
+  .seg.full { display:flex; } .seg.full button { flex:1; padding:0 12px; }
 
   .search { display:flex; align-items:center; gap:8px; height:40px; padding:0 16px; border-radius:20px; background:var(--sc-high); min-width:240px; color:var(--on-surface-variant); }
   .search input { border:0; outline:0; background:transparent; color:var(--on-surface); font-size:14px; flex:1; min-width:0; }
@@ -182,9 +182,9 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   @keyframes pulse { 50% { opacity:.3; } }
 
   .lv { display:inline-flex; align-items:flex-end; gap:2px; height:14px; vertical-align:-1px; }
-  .lv i { width:4px; border-radius:1px; background:var(--outline-variant); }
-  .lv i:nth-child(1) { height:5px; } .lv i:nth-child(2) { height:9px; } .lv i:nth-child(3) { height:14px; }
-  .lv.l1 i:nth-child(-n+1), .lv.l2 i:nth-child(-n+2), .lv.l3 i { background:var(--primary); }
+  .lv i { width:3.5px; border-radius:1px; background:var(--outline-variant); }
+  .lv i:nth-child(1) { height:4px; } .lv i:nth-child(2) { height:7px; } .lv i:nth-child(3) { height:10px; } .lv i:nth-child(4) { height:14px; }
+  .lv.l1 i:nth-child(-n+1), .lv.l2 i:nth-child(-n+2), .lv.l3 i:nth-child(-n+3), .lv.l4 i { background:var(--primary); }
   .model { display:inline-flex; align-items:center; gap:8px; white-space:nowrap; }
 
   .ring { display:block; flex:none; }
@@ -489,9 +489,10 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
           </div>
           <div class="field-l"><label>思考强度</label>
             <div class="seg full" id="f-level">
-              <button type="button" data-act="lv-pick" data-v="low"><span class="lv l1"><i></i><i></i><i></i></span>低</button>
-              <button type="button" data-act="lv-pick" data-v="medium"><span class="lv l2"><i></i><i></i><i></i></span>中</button>
-              <button type="button" data-act="lv-pick" data-v="high"><span class="lv l3"><i></i><i></i><i></i></span>高</button>
+              <button type="button" data-act="lv-pick" data-v="low"><span class="lv l1"><i></i><i></i><i></i><i></i></span>低</button>
+              <button type="button" data-act="lv-pick" data-v="medium"><span class="lv l2"><i></i><i></i><i></i><i></i></span>中</button>
+              <button type="button" data-act="lv-pick" data-v="high"><span class="lv l3"><i></i><i></i><i></i><i></i></span>高</button>
+              <button type="button" data-act="lv-pick" data-v="xhigh"><span class="lv l4"><i></i><i></i><i></i><i></i></span>极高</button>
             </div>
           </div>
         </div>
@@ -567,7 +568,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
 <script>
   var S = { d: null, page: "home", tab: "req", q: "", sheet: null, cfgReady: false, dirty: false, level: "medium", layout: localStorage.getItem("agy-layout") || "side", last: 0 };
   var TITLES = { home: "首页", traffic: "请求", runtime: "运行", settings: "设置" };
-  var LV = { low: 1, medium: 2, high: 3 };
+  var LV = { low: 1, medium: 2, high: 3, xhigh: 4 };
   function $(id) { return document.getElementById(id); }
 
   /* ---------- CPA Panel Auth & Relative Path Helper ---------- */
@@ -655,7 +656,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   /* ---------- visual atoms ---------- */
   function lv(level) {
     var n = LV[level] || 0;
-    return '<span class="lv l' + n + '" data-tip="思考 ' + esc(level || "-") + '"><i></i><i></i><i></i></span>';
+    return '<span class="lv l' + n + '" data-tip="思考 ' + esc(level || "-") + '"><i></i><i></i><i></i><i></i></span>';
   }
   function upChip(m, big) {
     var t = isTrial(m);
