@@ -20,9 +20,20 @@ export interface OpenAIToolCallDelta {
 }
 
 export interface OpenAIMessageContentPart {
-  type: "text" | "image_url";
+  type: "text" | "input_text" | "image_url" | "input_image" | "image" | string;
   text?: string;
-  image_url?: { url: string };
+  image_url?: { url: string; detail?: string } | string;
+  url?: string;
+  mimeType?: string;
+  media_type?: string;
+  data?: string;
+  source?: {
+    type?: string;
+    media_type?: string;
+    mimeType?: string;
+    data?: string;
+    url?: string;
+  };
 }
 
 export interface OpenAIMessage {

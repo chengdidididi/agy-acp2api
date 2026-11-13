@@ -6,6 +6,7 @@ import { telemetryStore } from "../telemetry/metrics-store.js";
 import {
   AcpConfigOption,
   AcpModelInfo,
+  AcpPromptContentBlock,
   AcpPromptResult,
   AcpSessionNewResult,
   AcpSessionUpdateParams,
@@ -358,7 +359,7 @@ export class AcpWorker {
    */
   public async runPrompt(
     sessionId: string,
-    promptText: string,
+    promptInput: string | AcpPromptContentBlock[],
     acpModelId: string,
     callbacks: PromptStreamCallbacks,
     abortSignal?: AbortSignal
@@ -559,13 +560,20 @@ export class AcpWorker {
           },
         });
 
+        const promptBlocks: AcpPromptContentBlock[] =
+          typeof promptInput === "string"
+            ? [{ type: "text", text: promptInput }]
+            : promptInput.length > 0
+              ? promptInput
+              : [{ type: "text", text: "" }];
+
         this.writeJson({
           jsonrpc: "2.0",
           id: rpcId,
           method: "session/prompt",
           params: {
             sessionId,
-            prompt: [{ type: "text", text: promptText }],
+            prompt: promptBlocks,
           },
         });
 

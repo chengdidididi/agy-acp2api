@@ -7,13 +7,14 @@ import {
   resolveModelAndThinking,
 } from "../compiler/model-resolver.js";
 import {
-  compileDeltaPrompt,
-  compileFullPrompt,
+  compileDeltaPromptBlocks,
+  compileFullPromptBlocks,
 } from "../compiler/prompt-compiler.js";
 import { ToolCallStreamParser } from "../parser/stream-parser.js";
 import { PromptInterruptedError } from "../pool/acp-worker.js";
 import { WorkerPool } from "../pool/worker-pool.js";
 import { telemetryStore } from "../telemetry/metrics-store.js";
+import { AcpPromptContentBlock } from "../types/acp.js";
 import {
   OpenAIChatCompletionChunk,
   OpenAIChatCompletionRequest,
@@ -176,22 +177,27 @@ export function createGatewayApp(pool: WorkerPool): Hono {
     const unified = buildUnifiedModelCatalog(rawModels);
     const created = Math.floor(Date.now() / 1000);
 
-    const data: Array<Record<string, unknown>> = unified.map((m) => ({
-      id: m.id,
-      object: "model",
-      created,
-      owned_by: "antigravity-acp",
-      description: m.name,
-      thinking_levels: m.thinkingLevels,
-      default_thinking_level: m.defaultThinkingLevel,
-      reasoning_efforts: m.thinkingLevels,
-      capabilities: {
-        reasoning: true,
+    const data: Array<Record<string, unknown>> = unified.map((m) => {
+      const supportsVision = !m.id.toLowerCase().startsWith("gpt-oss");
+      return {
+        id: m.id,
+        object: "model",
+        created,
+        owned_by: "antigravity-acp",
+        description: m.name,
         thinking_levels: m.thinkingLevels,
         default_thinking_level: m.defaultThinkingLevel,
-        variants: m.variants,
-      },
-    }));
+        reasoning_efforts: m.thinkingLevels,
+        input_modalities: supportsVision ? ["text", "image"] : ["text"],
+        capabilities: {
+          reasoning: true,
+          vision: supportsVision,
+          thinking_levels: m.thinkingLevels,
+          default_thinking_level: m.defaultThinkingLevel,
+          variants: m.variants,
+        },
+      };
+    });
 
     return c.json({
       object: "list",
@@ -256,23 +262,46 @@ export function createGatewayApp(pool: WorkerPool): Hono {
       body.messages
     );
     let sessionId = lease.sessionId;
-    let promptText = "";
+    let promptBlocks: AcpPromptContentBlock[] = [];
+    let compiledSystemPromptAppend = "";
 
     try {
       if (lease.isReusedSession && sessionId) {
-        promptText = compileDeltaPrompt(
+        promptBlocks = await compileDeltaPromptBlocks(
           lease.deltaMessages,
-          lease.isRetryAfterInterrupt
+          lease.isRetryAfterInterrupt,
+          c.req.raw.signal
         );
       } else {
-        const compiled = compileFullPrompt(
+        const compiled = await compileFullPromptBlocks(
           body.messages,
           body.tools,
-          body.tool_choice
+          body.tool_choice,
+          c.req.raw.signal
         );
+        compiledSystemPromptAppend = compiled.systemPromptAppend;
+        promptBlocks = compiled.promptBlocks;
+      }
+    } catch (imgErr: any) {
+      pool.releaseWorker(lease.worker);
+      return c.json(
+        {
+          error: {
+            message: `Failed to process message image content: ${
+              imgErr?.message || String(imgErr)
+            }`,
+            type: "invalid_request_error",
+          },
+        },
+        400
+      );
+    }
+
+    if (!lease.isReusedSession || !sessionId) {
+      try {
         try {
           sessionId = await lease.worker.createSession(
-            compiled.systemPromptAppend,
+            compiledSystemPromptAppend,
             acpModelId
           );
         } catch (firstErr: any) {
@@ -284,7 +313,7 @@ export function createGatewayApp(pool: WorkerPool): Hono {
             body.messages
           );
           sessionId = await lease.worker.createSession(
-            compiled.systemPromptAppend,
+            compiledSystemPromptAppend,
             acpModelId
           );
         }
@@ -302,21 +331,20 @@ export function createGatewayApp(pool: WorkerPool): Hono {
           lease.worker.id,
           sessionId
         );
-        promptText = compiled.promptText;
-      }
-    } catch (err: any) {
-      pool.terminateWorker(lease.worker.id);
-      return c.json(
-        {
-          error: {
-            message: `Failed to initialize ACP session: ${
-              err?.message || String(err)
-            }`,
-            type: "server_error",
+      } catch (err: any) {
+        pool.terminateWorker(lease.worker.id);
+        return c.json(
+          {
+            error: {
+              message: `Failed to initialize ACP session: ${
+                err?.message || String(err)
+              }`,
+              type: "server_error",
+            },
           },
-        },
-        500
-      );
+          500
+        );
+      }
     }
 
     c.header("X-Agy2Api-Session-Cache", lease.isReusedSession ? "HIT" : "MISS");
@@ -429,7 +457,7 @@ export function createGatewayApp(pool: WorkerPool): Hono {
         try {
           const promptRes = await lease.worker.runPrompt(
             sessionId!,
-            promptText,
+            promptBlocks,
             acpModelId,
             {
               onActualModelDetected: (detectedVer) => {
@@ -584,7 +612,7 @@ export function createGatewayApp(pool: WorkerPool): Hono {
     try {
       const promptRes = await lease.worker.runPrompt(
         sessionId,
-        promptText,
+        promptBlocks,
         acpModelId,
         {
           onThoughtChunk: (thoughtText) => {

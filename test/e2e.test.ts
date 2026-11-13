@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { serve } from "@hono/node-server";
 import { config } from "../src/config.js";
 import {
@@ -11,9 +12,14 @@ import {
 } from "../src/compiler/model-resolver.js";
 import {
   compileDeltaPrompt,
+  compileDeltaPromptBlocks,
   compileFullPrompt,
+  compileFullPromptBlocks,
 } from "../src/compiler/prompt-compiler.js";
-import { SessionAffinityRegistry } from "../src/compiler/session-hash.js";
+import {
+  SessionAffinityRegistry,
+  computeUserFingerprint,
+} from "../src/compiler/session-hash.js";
 import {
    TelemetryStore,
   telemetryStore,
@@ -518,10 +524,165 @@ async function consumeSseStream(res: Response): Promise<{
   return { content, toolCalls, finishReason, lastModel, usage };
 }
 
+function makeSolidColorPngBase64(
+  r: number,
+  g: number,
+  b: number,
+  width: number = 32,
+  height: number = 32
+): string {
+  const crcTable = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    crcTable[n] = c >>> 0;
+  }
+  const crc32 = (buf: Buffer): number => {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) {
+      c = crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    }
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const pngChunk = (type: string, data: Buffer): Buffer => {
+    const typeBuf = Buffer.from(type, "ascii");
+    const lenBuf = Buffer.alloc(4);
+    lenBuf.writeUInt32BE(data.length, 0);
+    const crcBuf = Buffer.alloc(4);
+    crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+    return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
+  };
+
+  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  const raw = Buffer.alloc(height * (1 + width * 3));
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * (1 + width * 3);
+    raw[rowStart] = 0;
+    for (let x = 0; x < width; x++) {
+      raw[rowStart + 1 + x * 3] = r;
+      raw[rowStart + 1 + x * 3 + 1] = g;
+      raw[rowStart + 1 + x * 3 + 2] = b;
+    }
+  }
+  const idat = zlib.deflateSync(raw);
+  return Buffer.concat([
+    sig,
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", idat),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]).toString("base64");
+}
+
+async function testMultimodalImageCompilerUnit() {
+  console.log(
+    "2c. [Unit Test] Testing Multimodal Image ContentBlocks, MIME Normalization & Image Fingerprints..."
+  );
+
+  const redB64 = makeSolidColorPngBase64(255, 0, 0);
+  const blueB64 = makeSolidColorPngBase64(0, 0, 255);
+  const wrappedJpgLike = `/9j/4AAQSkZJRgABAQAAAQABAAD/\n2wBDAAEBAQEBAQEBAQ==`;
+
+  // 1. `image/jpg` alias + Android newline wrapping -> normalized `image/jpeg` without whitespace
+  const compiledJpg = await compileFullPromptBlocks([
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "Describe this photo" },
+        {
+          type: "image_url",
+          image_url: { url: `data:image/jpg;base64,${wrappedJpgLike}` },
+        },
+      ],
+    },
+  ]);
+  assert.equal(compiledJpg.promptBlocks.length, 2);
+  assert.deepEqual(compiledJpg.promptBlocks[0], {
+    type: "text",
+    text: "Describe this photo",
+  });
+  assert.deepEqual(compiledJpg.promptBlocks[1], {
+    type: "image",
+    mimeType: "image/jpeg",
+    data: "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAEBAQEBAQEBAQ==",
+  });
+
+  // 2. Pure image upload with empty text part (`[{ type: "text", text: "" }, { type: "image_url", ... }]`)
+  // must omit empty text block so upstream CCPA never receives `{ text: "" }`
+  const pureImg = await compileFullPromptBlocks([
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "" },
+        {
+          type: "image_url",
+          image_url: { url: `data:image/png;base64,${redB64}` },
+        },
+      ],
+    },
+  ]);
+  assert.equal(pureImg.promptBlocks.length, 1);
+  assert.equal(pureImg.promptBlocks[0].type, "image");
+
+  // 3. Distinct images with identical/empty text must produce distinct `computeUserFingerprint`
+  const fpRed = computeUserFingerprint({
+    role: "user",
+    content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${redB64}` } }],
+  });
+  const fpBlue = computeUserFingerprint({
+    role: "user",
+    content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${blueB64}` } }],
+  });
+  assert.notEqual(fpRed, fpBlue);
+
+  // 4. Multi-turn Session Cache HIT with historical Base64 image -> delta sends ONLY new follow-up text
+  const reg = new SessionAffinityRegistry(1_800_000);
+  const imgTurn1: OpenAIMessage[] = [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "What color is this?" },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${redB64}` } },
+      ],
+    },
+    { role: "assistant", content: "It is solid red." },
+  ];
+  reg.registerTurnState("gemini-3.8-flash", undefined, imgTurn1, "w1", "s_img", 1600);
+
+  const imgTurn2Incoming: OpenAIMessage[] = [
+    ...imgTurn1,
+    { role: "user", content: "Are you sure?" },
+  ];
+  const imgHit = reg.findBestMatchingPrefix(
+    "gemini-3.8-flash",
+    undefined,
+    imgTurn2Incoming,
+    () => true
+  );
+  assert.ok(imgHit, "Expected session cache HIT on Turn 2 of multimodal conversation");
+  assert.equal(imgHit!.deltaMessages.length, 1);
+  const deltaBlocks = await compileDeltaPromptBlocks(
+    imgHit!.deltaMessages,
+    imgHit!.isRetryAfterInterrupt
+  );
+  assert.deepEqual(deltaBlocks, [{ type: "text", text: "Are you sure?" }]);
+
+  console.log(
+    "   -> Passed! Multimodal ContentBlocks, MIME normalization, pure-image stripping & image session affinity verified."
+  );
+}
+
 async function runIntegrationTest() {
   testSlidingWindowParserUnit();
   testUnifiedModelAndEffortResolverUnit();
   testSessionAnchorAndPromptFramingUnit();
+  await testMultimodalImageCompilerUnit();
 
   console.log("\n3. [E2E Test] Booting WorkerPool and Hono Gateway Server...");
   const pool = new WorkerPool();
@@ -933,6 +1094,87 @@ async function runIntegrationTest() {
       JSON.stringify(preemptTurn.content)
     );
     assert.ok(preemptTurn.content.includes("OMEGA-SH-7749"));
+
+    console.log(
+      "\n10. [E2E Turn 5 — RikkaHub-Style Multimodal Image Upload & Multi-Turn Cache HIT]..."
+    );
+    const solidRedPngB64 = makeSolidColorPngBase64(255, 0, 0);
+    const imgTurn1Messages: OpenAIMessage[] = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "What single primary color is this square image? Reply in English.",
+          },
+          {
+            type: "image_url",
+            image_url: {
+              url: `data:image/png;base64,${solidRedPngB64}`,
+            },
+          },
+        ],
+      },
+    ];
+
+    const resImg1 = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-3.8-flash(low)",
+        messages: imgTurn1Messages,
+        stream: true,
+      }),
+    });
+    assert.equal(resImg1.status, 200);
+    assert.equal(resImg1.headers.get("X-Agy2Api-Session-Cache"), "MISS");
+    const imgSessionId = resImg1.headers.get("X-Agy2Api-Session-Id");
+    const imgTurn1 = await consumeSseStream(resImg1);
+    console.log(
+      "   -> Image Turn 1 Reply:",
+      JSON.stringify(imgTurn1.content),
+      "SessionId:",
+      imgSessionId
+    );
+    assert.ok(
+      imgTurn1.content.toLowerCase().includes("red"),
+      `Expected model to recognize red image, got: ${imgTurn1.content}`
+    );
+
+    const imgTurn2Messages: OpenAIMessage[] = [
+      ...imgTurn1Messages,
+      {
+        role: "assistant",
+        content: imgTurn1.content,
+      },
+      {
+        role: "user",
+        content:
+          "Was the image I just sent red or blue? Reply with ONLY one English word.",
+      },
+    ];
+    const resImg2 = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-3.8-flash(low)",
+        messages: imgTurn2Messages,
+        stream: false,
+      }),
+    });
+    assert.equal(resImg2.status, 200);
+    assert.equal(resImg2.headers.get("X-Agy2Api-Session-Cache"), "HIT");
+    assert.equal(resImg2.headers.get("X-Agy2Api-Session-Id"), imgSessionId);
+    const imgTurn2Json = (await resImg2.json()) as any;
+    const imgTurn2Text = String(imgTurn2Json.choices[0].message.content || "");
+    console.log("   -> Image Turn 2 (Cache HIT) Reply:", JSON.stringify(imgTurn2Text));
+    assert.ok(imgTurn2Text.toLowerCase().includes("red"));
 
     console.log("\nALL UNIT & E2E TESTS PASSED SUCCESSFULLY!");
   } finally {

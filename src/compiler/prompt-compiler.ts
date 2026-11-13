@@ -1,9 +1,15 @@
+import { AcpPromptContentBlock } from "../types/acp.js";
 import { OpenAIMessage, OpenAIToolDefinition } from "../types/openai.js";
+import {
+  extractContentSegments,
+  resolveImageSourceToBlock,
+} from "./image-content.js";
 import { extractTextContent } from "./session-hash.js";
 
 export interface CompiledContext {
   systemPromptAppend: string;
   promptText: string;
+  promptBlocks?: AcpPromptContentBlock[];
 }
 
 /**
@@ -208,4 +214,215 @@ export function compileDeltaPrompt(
       return `[${m.role.toUpperCase()}]\n${body}`;
     })
     .join("\n\n");
+}
+
+class PromptBlockBuilder {
+  private blocks: AcpPromptContentBlock[] = [];
+
+  public pushText(text: string): void {
+    if (!text) return;
+    const last = this.blocks[this.blocks.length - 1];
+    if (last && last.type === "text") {
+      last.text += text;
+    } else {
+      this.blocks.push({ type: "text", text });
+    }
+  }
+
+  public pushImage(imageBlock: AcpPromptContentBlock): void {
+    this.blocks.push(imageBlock);
+  }
+
+  public finalize(): AcpPromptContentBlock[] {
+    const hasImage = this.blocks.some((b) => b.type === "image");
+    if (!hasImage) {
+      return this.blocks.length > 0 ? this.blocks : [{ type: "text", text: "" }];
+    }
+
+    const cleaned: AcpPromptContentBlock[] = [];
+    for (const b of this.blocks) {
+      if (b.type === "text" && !/\S/.test(b.text)) {
+        continue;
+      }
+      const prev = cleaned[cleaned.length - 1];
+      if (b.type === "text" && prev && prev.type === "text") {
+        prev.text += b.text;
+      } else {
+        cleaned.push(b);
+      }
+    }
+
+    return cleaned.length > 0 ? cleaned : [{ type: "text", text: "" }];
+  }
+}
+
+async function appendSingleMessageBlocks(
+  builder: PromptBlockBuilder,
+  msg: OpenAIMessage,
+  abortSignal?: AbortSignal,
+  trimUserText: boolean = true
+): Promise<void> {
+  const segments = extractContentSegments(msg.content);
+  const hasImages = segments.some((s) => s.kind !== "text");
+
+  if (!hasImages) {
+    if (msg.role === "user" && !trimUserText) {
+      builder.pushText(extractTextContent(msg.content));
+    } else {
+      builder.pushText(serializeSingleMessage(msg));
+    }
+    return;
+  }
+
+  if (msg.role === "tool") {
+    const idAttr = msg.tool_call_id ? ` id="${msg.tool_call_id}"` : "";
+    const nameAttr = msg.name ? ` name="${msg.name}"` : "";
+    builder.pushText(`<tool_response${idAttr}${nameAttr}>\n`);
+    for (const seg of segments) {
+      if (seg.kind === "text") {
+        const trimmed = seg.text.trim();
+        if (trimmed) builder.pushText(trimmed);
+      } else {
+        builder.pushImage(await resolveImageSourceToBlock(seg, abortSignal));
+      }
+    }
+    builder.pushText(`\n</tool_response>`);
+    return;
+  }
+
+  if (msg.role === "assistant") {
+    for (const seg of segments) {
+      if (seg.kind !== "text") {
+        builder.pushImage(await resolveImageSourceToBlock(seg, abortSignal));
+      }
+    }
+    const serialized = serializeSingleMessage(msg);
+    if (serialized) {
+      builder.pushText(serialized);
+    }
+    return;
+  }
+
+  // `user` (or fallback role) with one or more attached images
+  for (const seg of segments) {
+    if (seg.kind === "text") {
+      const txt = trimUserText ? seg.text.trim() : seg.text;
+      if (txt) builder.pushText(txt);
+    } else {
+      builder.pushImage(await resolveImageSourceToBlock(seg, abortSignal));
+    }
+  }
+}
+
+async function appendMessageSequenceBlocks(
+  builder: PromptBlockBuilder,
+  msgs: OpenAIMessage[],
+  tagged: boolean,
+  abortSignal?: AbortSignal
+): Promise<void> {
+  for (let i = 0; i < msgs.length; i++) {
+    if (i > 0) {
+      builder.pushText("\n\n");
+    }
+    const m = msgs[i];
+    if (tagged && m.role !== "tool") {
+      builder.pushText(`[${m.role.toUpperCase()}]\n`);
+    }
+    await appendSingleMessageBlocks(builder, m, abortSignal, true);
+  }
+}
+
+/**
+ * Multimodal-aware full prompt compiler for `session/new` (Cache Miss).
+ * Preserves exact chronological ordering of text and `{ type: "image", mimeType, data }`
+ * ACP ContentBlocks while remaining 100% identical to `compileFullPrompt` on text-only inputs.
+ */
+export async function compileFullPromptBlocks(
+  messages: OpenAIMessage[],
+  tools?: OpenAIToolDefinition[],
+  toolChoice?: unknown,
+  abortSignal?: AbortSignal
+): Promise<CompiledContext & { promptBlocks: AcpPromptContentBlock[] }> {
+  const base = compileFullPrompt(messages, tools, toolChoice);
+  const nonSystem = messages.filter(
+    (m) => m.role !== "system" && m.role !== "developer"
+  );
+
+  const builder = new PromptBlockBuilder();
+
+  if (nonSystem.length === 1 && nonSystem[0].role === "user") {
+    await appendSingleMessageBlocks(builder, nonSystem[0], abortSignal, false);
+    return {
+      ...base,
+      promptBlocks: builder.finalize(),
+    };
+  }
+
+  let lastUserIdx = -1;
+  for (let i = nonSystem.length - 1; i >= 0; i--) {
+    if (nonSystem[i].role === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+
+  if (lastUserIdx > 0) {
+    builder.pushText("<conversation_history>\n");
+    await appendMessageSequenceBlocks(
+      builder,
+      nonSystem.slice(0, lastUserIdx),
+      true,
+      abortSignal
+    );
+    builder.pushText("\n</conversation_history>\n\n");
+    await appendMessageSequenceBlocks(
+      builder,
+      nonSystem.slice(lastUserIdx),
+      true,
+      abortSignal
+    );
+    return {
+      ...base,
+      promptBlocks: builder.finalize(),
+    };
+  }
+
+  await appendMessageSequenceBlocks(builder, nonSystem, true, abortSignal);
+  return {
+    ...base,
+    promptBlocks: builder.finalize(),
+  };
+}
+
+/**
+ * Multimodal-aware delta prompt compiler for warm ACP sessions (Session Cache HIT).
+ * Sends only the newly added text and/or image `ContentBlock`s for the current turn.
+ */
+export async function compileDeltaPromptBlocks(
+  deltaMessages: OpenAIMessage[],
+  isRetryAfterInterrupt: boolean = false,
+  abortSignal?: AbortSignal
+): Promise<AcpPromptContentBlock[]> {
+  if (deltaMessages.length === 0) {
+    return [{ type: "text", text: "" }];
+  }
+
+  const builder = new PromptBlockBuilder();
+
+  if (deltaMessages.every((m) => m.role === "tool")) {
+    await appendMessageSequenceBlocks(builder, deltaMessages, false, abortSignal);
+    return builder.finalize();
+  }
+
+  if (
+    deltaMessages.length === 1 &&
+    deltaMessages[0].role === "user" &&
+    !isRetryAfterInterrupt
+  ) {
+    await appendSingleMessageBlocks(builder, deltaMessages[0], abortSignal, true);
+    return builder.finalize();
+  }
+
+  await appendMessageSequenceBlocks(builder, deltaMessages, true, abortSignal);
+  return builder.finalize();
 }

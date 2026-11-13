@@ -57,6 +57,17 @@ export interface AcpSessionNewResult {
   configOptions?: AcpConfigOption[];
 }
 
+export type AcpPromptContentBlock =
+  | {
+      type: "text";
+      text: string;
+    }
+  | {
+      type: "image";
+      mimeType: string;
+      data: string;
+    };
+
 export interface AcpPromptResult {
   stopReason: "end_turn" | "max_tokens" | "cancelled" | "refusal" | string;
   usage?: {

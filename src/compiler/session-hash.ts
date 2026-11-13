@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { OpenAIMessage, OpenAIToolDefinition } from "../types/openai.js";
+import { extractImageFingerprints } from "./image-content.js";
 
 export const MAX_CONSECUTIVE_SESSION_ABORTS = 2;
 export const MAX_SESSION_CONTEXT_TOKENS = 900_000;
@@ -69,9 +70,13 @@ export function extractTextContent(content: OpenAIMessage["content"]): string {
   if (!content) return "";
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    return content
-      .map((part) => (part.type === "text" ? part.text || "" : ""))
-      .join("\n");
+    const textParts: string[] = [];
+    for (const part of content) {
+      if (part && (part.type === "text" || part.type === "input_text")) {
+        textParts.push(part.text || "");
+      }
+    }
+    return textParts.join("\n");
   }
   return String(content);
 }
@@ -110,7 +115,11 @@ function normalizeTextForFingerprint(raw: string): string {
 
 export function computeUserFingerprint(msg: OpenAIMessage): string {
   const norm = normalizeTextForFingerprint(extractTextContent(msg.content));
-  return `usr:${sha256Short(norm)}`;
+  const imageFps = extractImageFingerprints(msg.content);
+  if (imageFps.length === 0) {
+    return `usr:${sha256Short(norm)}`;
+  }
+  return `usr:${sha256Short(JSON.stringify({ text: norm, images: imageFps }))}`;
 }
 
 export function computeAssistantTextFingerprint(
@@ -148,6 +157,7 @@ export function canonicalizeMessage(
 ): Record<string, unknown> {
   const role = msg.role === "developer" ? "system" : msg.role;
   const text = extractTextContent(msg.content).trim();
+  const imageFps = extractImageFingerprints(msg.content);
 
   if (role === "assistant") {
     const toolCalls = (msg.tool_calls || []).map((tc) => ({
@@ -158,6 +168,7 @@ export function canonicalizeMessage(
       role: "assistant",
       content: text,
       toolCalls,
+      ...(imageFps.length > 0 ? { images: imageFps } : {}),
     };
   }
 
@@ -165,12 +176,14 @@ export function canonicalizeMessage(
     return {
       role: "tool",
       content: text,
+      ...(imageFps.length > 0 ? { images: imageFps } : {}),
     };
   }
 
   return {
     role,
     content: text,
+    ...(imageFps.length > 0 ? { images: imageFps } : {}),
   };
 }
 
